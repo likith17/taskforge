@@ -1,146 +1,58 @@
+//! The PostgreSQL implementation of [`JobStore`].
+//!
+//! Every state transition is one SQL statement, so it is atomic without an
+//! explicit transaction and cannot be half-applied by a crash. Every deadline
+//! is compared with the database's `now()`, so API, worker and scheduler
+//! machines never need synchronised clocks.
+
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use taskforge_domain::{
-    AttemptOutcome, Job, JobAttempt, JobId, JobState, MAX_MAX_ATTEMPTS, NewJob, RetryPolicy,
-    Schedule,
+    AttemptOutcome, Jitter, Job, JobAttempt, JobId, JobState, MAX_MAX_ATTEMPTS, NewJob,
+    RetryPolicy, Schedule, SplitMix64,
 };
 use uuid::Uuid;
 
-use crate::StoreError;
-
-/// Longest error message persisted with a failed job.
-const MAX_ERROR_BYTES: usize = 4096;
+use crate::types::{MAX_ERROR_BYTES, truncate};
+use crate::{
+    CancelOutcome, Claim, ClaimedJob, Heartbeat, JobStore, ListFilter, QueueStats, Reaped,
+    StoreError, Submitted,
+};
 
 /// The guard every settle statement carries. It matches only while the caller
-/// still holds the current attempt of a running job.
+/// still holds the current attempt of a running job: this one line is the
+/// fencing check.
 const HOLDS_CLAIM: &str =
     "j.id = $1 AND j.state = 'running' AND j.lease_owner = $2 AND j.attempt = $3";
 
-/// Proof that a worker holds a particular attempt of a job.
-///
-/// Only [`JobStore::claim`] creates one, and settling a job requires
-/// presenting it. The pair (worker, attempt) is the fencing token: because
-/// every claim increments `attempt`, a claim that has been superseded can
-/// never match the row again.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Claim {
-    // Crate-private: other crates cannot forge a claim, only receive one.
-    pub(crate) job_id: JobId,
-    pub(crate) worker_id: String,
-    pub(crate) attempt: i32,
-}
-
-impl Claim {
-    pub fn job_id(&self) -> JobId {
-        self.job_id
-    }
-
-    pub fn worker_id(&self) -> &str {
-        &self.worker_id
-    }
-
-    pub fn attempt(&self) -> i32 {
-        self.attempt
-    }
-}
-
 #[derive(Debug, Clone)]
-pub struct ClaimedJob {
-    pub job: Job,
-    pub claim: Claim,
-}
-
-/// Result of a submission.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Submitted {
-    /// A new job was created.
-    Created(Job),
-    /// The idempotency key was seen before; this is the job it created.
-    Duplicate(Job),
-}
-
-impl Submitted {
-    pub fn job(&self) -> &Job {
-        match self {
-            Submitted::Created(job) | Submitted::Duplicate(job) => job,
-        }
-    }
-
-    pub fn into_job(self) -> Job {
-        match self {
-            Submitted::Created(job) | Submitted::Duplicate(job) => job,
-        }
-    }
-
-    pub fn is_duplicate(&self) -> bool {
-        matches!(self, Submitted::Duplicate(_))
-    }
-}
-
-/// What a heartbeat learned about the claims it tried to renew.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Heartbeat {
-    /// Claims that no longer hold: stop working on these jobs.
-    pub lost: Vec<JobId>,
-    /// Still held (and renewed), but someone asked for cancellation.
-    pub cancel_requested: Vec<JobId>,
-}
-
-/// Result of a cancellation request.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CancelOutcome {
-    /// The job is cancelled (it was queued, or had been cancelled before).
-    Cancelled(Job),
-    /// The job is running. The request is recorded; the worker will see it at
-    /// its next heartbeat. The job may still succeed if it finishes first.
-    Requested(Job),
-    /// The job already succeeded or was dead-lettered; nothing to cancel.
-    AlreadyFinished(Job),
-}
-
-/// What one reaper pass did with the expired leases it found.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Reaped {
-    pub requeued: u64,
-    pub dead: u64,
-    pub cancelled: u64,
-}
-
-impl Reaped {
-    pub fn total(&self) -> u64 {
-        self.requeued + self.dead + self.cancelled
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ListFilter {
-    pub state: Option<JobState>,
-    pub queue: Option<String>,
-    pub kind: Option<String>,
-    /// Keyset cursor: only jobs created before this one.
-    pub before: Option<JobId>,
-    pub limit: u32,
-}
-
-#[derive(Debug, Clone)]
-pub struct JobStore {
+pub struct PgJobStore {
     pool: PgPool,
     retry: RetryPolicy,
+    jitter: Arc<dyn Jitter>,
 }
 
-impl JobStore {
+impl PgJobStore {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
             retry: RetryPolicy::default(),
+            jitter: Arc::new(SplitMix64::from_entropy()),
         }
     }
 
     pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// Replace the jitter source, e.g. with a seeded or fixed one in tests.
+    pub fn with_jitter(mut self, jitter: Arc<dyn Jitter>) -> Self {
+        self.jitter = jitter;
         self
     }
 
@@ -152,21 +64,50 @@ impl JobStore {
         &self.pool
     }
 
-    /// Cheap round trip, for readiness checks.
-    pub async fn ping(&self) -> Result<(), StoreError> {
+    /// Interpret the outcome of a fenced UPDATE. No row means the guard did not
+    /// match: find out why, so the caller gets a precise error.
+    async fn settled(&self, claim: &Claim, row: Option<JobRow>) -> Result<Job, StoreError> {
+        if let Some(row) = row {
+            return row.try_into();
+        }
+        let current = self
+            .get(claim.job_id)
+            .await?
+            .ok_or(StoreError::NotFound(claim.job_id))?;
+        Err(StoreError::StaleClaim {
+            job_id: claim.job_id,
+            worker_id: claim.worker_id.clone(),
+            attempt: claim.attempt,
+            current_state: current.state,
+            current_attempt: current.attempt,
+        })
+    }
+
+    /// Run a settle statement whose first three parameters are the claim.
+    async fn settle(&self, claim: &Claim, sql: &str) -> Result<Job, StoreError> {
+        let row = sqlx::query_as::<_, JobRow>(sql)
+            .bind(claim.job_id.as_uuid())
+            .bind(&claim.worker_id)
+            .bind(claim.attempt)
+            .fetch_optional(&self.pool)
+            .await?;
+        self.settled(claim, row).await
+    }
+}
+
+impl JobStore for PgJobStore {
+    async fn ping(&self) -> Result<(), StoreError> {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
     }
 
     // ------------------------------------------------------------- submission
 
-    /// Persist a new job as `queued`. Durable once this returns.
-    ///
     /// With an idempotency key the insert happens at most once, however many
     /// times and however concurrently it is attempted: the unique index turns
     /// every insert after the first into a no-op, and the caller is handed the
     /// job the first one created.
-    pub async fn submit(&self, job: &NewJob) -> Result<Submitted, StoreError> {
+    async fn submit(&self, job: &NewJob) -> Result<Submitted, StoreError> {
         // Relative delays are resolved against the database clock, the same
         // clock the claim query compares `run_at` with.
         let (run_at, delay): (Option<DateTime<Utc>>, Duration) = match job.schedule() {
@@ -177,15 +118,15 @@ impl JobStore {
         let key = job.idempotency_key().map(|k| k.as_str());
 
         // The loop only repeats in one corner case: the row we collided with
-        // was deleted before we could read it.
+        // was purged before we could read it.
         for _ in 0..3 {
             let inserted = sqlx::query_as::<_, JobRow>(
                 r#"
-                INSERT INTO jobs (id, queue, kind, payload, priority, run_at,
-                                  max_attempts, idempotency_key)
+                INSERT INTO jobs (id, queue, kind, payload, priority, run_at, max_attempts,
+                                  timeout_secs, idempotency_key, request_hash)
                 VALUES ($1, $2, $3, $4, $5,
                         COALESCE($6::timestamptz, now()) + make_interval(secs => $7::float8),
-                        $8, $9)
+                        $8, $9, $10, $11)
                 ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
                 RETURNING *
                 "#,
@@ -198,7 +139,9 @@ impl JobStore {
             .bind(run_at)
             .bind(delay.as_secs_f64())
             .bind(job.max_attempts())
+            .bind(job.timeout_secs())
             .bind(key)
+            .bind(job.request_hash())
             .fetch_optional(&self.pool)
             .await?;
             if let Some(row) = inserted {
@@ -233,14 +176,9 @@ impl JobStore {
         ))
     }
 
-    /// [`JobStore::submit`], for callers that do not care whether the job is new.
-    pub async fn insert(&self, job: &NewJob) -> Result<Job, StoreError> {
-        self.submit(job).await.map(Submitted::into_job)
-    }
-
     // ---------------------------------------------------------------- queries
 
-    pub async fn get(&self, id: JobId) -> Result<Option<Job>, StoreError> {
+    async fn get(&self, id: JobId) -> Result<Option<Job>, StoreError> {
         sqlx::query_as::<_, JobRow>("SELECT * FROM jobs WHERE id = $1")
             .bind(id.as_uuid())
             .fetch_optional(&self.pool)
@@ -249,8 +187,7 @@ impl JobStore {
             .transpose()
     }
 
-    /// Newest first, with keyset pagination on the (time-ordered) id.
-    pub async fn list(&self, filter: &ListFilter) -> Result<Vec<Job>, StoreError> {
+    async fn list(&self, filter: &ListFilter) -> Result<Vec<Job>, StoreError> {
         let mut query = QueryBuilder::<Postgres>::new("SELECT * FROM jobs WHERE true");
         if let Some(state) = filter.state {
             query.push(" AND state = ").push_bind(state.as_str());
@@ -276,8 +213,7 @@ impl JobStore {
             .collect()
     }
 
-    /// Delivery history of a job, oldest attempt first.
-    pub async fn attempts(&self, id: JobId) -> Result<Vec<JobAttempt>, StoreError> {
+    async fn attempts(&self, id: JobId) -> Result<Vec<JobAttempt>, StoreError> {
         sqlx::query_as::<_, AttemptRow>(
             "SELECT attempt, worker_id, started_at, finished_at, outcome, error
              FROM job_attempts WHERE job_id = $1 ORDER BY attempt",
@@ -292,14 +228,16 @@ impl JobStore {
 
     // ------------------------------------------------------------------ claim
 
-    /// Lease up to `limit` runnable jobs on any of `queues` to `worker_id`.
+    /// One statement, hence atomic: pick the best candidates, skipping rows a
+    /// concurrent claimer has locked (`FOR UPDATE SKIP LOCKED`), mark them
+    /// running, bump the fencing token, start the lease and open an attempt
+    /// record.
     ///
-    /// One statement, hence atomic: it picks the best candidates, skipping
-    /// rows a concurrent claimer has locked (`FOR UPDATE SKIP LOCKED`), marks
-    /// them running, bumps the fencing token, starts the lease and opens an
-    /// attempt record. Two workers calling this at the same instant always
-    /// receive different jobs.
-    pub async fn claim(
+    /// Why `SKIP LOCKED`: a plain `FOR UPDATE` is also correct, but every
+    /// concurrent claimer would queue behind the first one's lock on the same
+    /// "next" row. A read-then-update without locking is not correct at all:
+    /// two workers read the same row and both run it.
+    async fn claim(
         &self,
         worker_id: &str,
         queues: &[String],
@@ -357,23 +295,12 @@ impl JobStore {
             .collect()
     }
 
-    /// [`JobStore::claim`] for a single job.
-    pub async fn claim_next(
-        &self,
-        worker_id: &str,
-        queues: &[String],
-        lease: Duration,
-    ) -> Result<Option<ClaimedJob>, StoreError> {
-        Ok(self.claim(worker_id, queues, lease, 1).await?.pop())
-    }
-
     // -------------------------------------------------------------- heartbeat
 
-    /// Renew the lease on every claim that still holds, in one statement.
-    ///
-    /// Renewal is fenced like everything else: a claim that has been
-    /// superseded is not renewed and is reported in `lost`.
-    pub async fn heartbeat(
+    /// Renew every claim that still holds, in one statement. Renewal is fenced
+    /// like everything else: a superseded claim is not renewed and is
+    /// reported in `lost`.
+    async fn heartbeat(
         &self,
         worker_id: &str,
         claims: &[Claim],
@@ -419,16 +346,11 @@ impl JobStore {
 
     // --------------------------------------------------------------- settling
     //
-    // Each of these is one statement that changes the job and closes its
-    // attempt record together, and applies only if `claim` is still the
-    // current attempt. Otherwise nothing is written and `StaleClaim` is
-    // returned.
+    // Each settle is one statement that changes the job and closes its attempt
+    // record together, and applies only if `claim` is still the current
+    // attempt. Otherwise nothing is written and `StaleClaim` is returned.
 
-    /// Commit a successful result: `running -> succeeded`.
-    ///
-    /// Succeeds even if cancellation was requested in the meantime: the first
-    /// committed outcome wins, and this one got there first.
-    pub async fn complete(&self, claim: &Claim, result: &Value) -> Result<Job, StoreError> {
+    async fn complete(&self, claim: &Claim, result: &Value) -> Result<Job, StoreError> {
         let sql = format!(
             r#"
             WITH settled AS (
@@ -457,21 +379,11 @@ impl JobStore {
         self.settled(claim, row).await
     }
 
-    /// Record a failed attempt.
-    ///
-    /// * retryable and attempts remain: `running -> queued`, delayed by backoff
-    /// * otherwise: `running -> dead` (dead-lettered)
-    /// * cancellation was requested: `running -> cancelled`
-    pub async fn fail(
-        &self,
-        claim: &Claim,
-        error: &str,
-        retryable: bool,
-    ) -> Result<Job, StoreError> {
+    async fn fail(&self, claim: &Claim, error: &str, retryable: bool) -> Result<Job, StoreError> {
         let sql = failure_sql(
             "",
             &format!("WHERE {HOLDS_CLAIM}"),
-            ["$4", "$5", "$6", "$7"],
+            ["$4", "$5", "$6", "$7", "$8::float8"],
         );
         let row = sqlx::query_as::<_, JobRow>(&sql)
             .bind(claim.job_id.as_uuid())
@@ -481,15 +393,13 @@ impl JobStore {
             .bind(retryable)
             .bind(self.retry.ceilings_secs(MAX_MAX_ATTEMPTS))
             .bind(AttemptOutcome::Failed.as_str())
+            .bind(self.jitter.sample())
             .fetch_optional(&self.pool)
             .await?;
         self.settled(claim, row).await
     }
 
-    /// Hand an unfinished job back during graceful shutdown:
-    /// `running -> queued`, runnable at once, without counting a failure.
-    /// (If cancellation was requested, it becomes `cancelled` instead.)
-    pub async fn release(&self, claim: &Claim) -> Result<Job, StoreError> {
+    async fn release(&self, claim: &Claim) -> Result<Job, StoreError> {
         let sql = format!(
             r#"
             WITH settled AS (
@@ -511,18 +421,10 @@ impl JobStore {
             SELECT * FROM settled
             "#
         );
-        let row = sqlx::query_as::<_, JobRow>(&sql)
-            .bind(claim.job_id.as_uuid())
-            .bind(&claim.worker_id)
-            .bind(claim.attempt)
-            .fetch_optional(&self.pool)
-            .await?;
-        self.settled(claim, row).await
+        self.settle(claim, &sql).await
     }
 
-    /// The worker stopped the handler because cancellation was requested:
-    /// `running -> cancelled`. Applies only if it really was requested.
-    pub async fn acknowledge_cancel(&self, claim: &Claim) -> Result<Job, StoreError> {
+    async fn acknowledge_cancel(&self, claim: &Claim) -> Result<Job, StoreError> {
         let sql = format!(
             r#"
             WITH settled AS (
@@ -541,63 +443,43 @@ impl JobStore {
             SELECT * FROM settled
             "#
         );
-        let row = sqlx::query_as::<_, JobRow>(&sql)
-            .bind(claim.job_id.as_uuid())
-            .bind(&claim.worker_id)
-            .bind(claim.attempt)
-            .fetch_optional(&self.pool)
-            .await?;
-        self.settled(claim, row).await
-    }
-
-    /// Interpret the outcome of a fenced UPDATE. No row means the guard did not
-    /// match: find out why, so the caller gets a precise error.
-    async fn settled(&self, claim: &Claim, row: Option<JobRow>) -> Result<Job, StoreError> {
-        if let Some(row) = row {
-            return row.try_into();
-        }
-        let current = self
-            .get(claim.job_id)
-            .await?
-            .ok_or(StoreError::NotFound(claim.job_id))?;
-        Err(StoreError::StaleClaim {
-            job_id: claim.job_id,
-            worker_id: claim.worker_id.clone(),
-            attempt: claim.attempt,
-            current_state: current.state,
-            current_attempt: current.attempt,
-        })
+        self.settle(claim, &sql).await
     }
 
     // --------------------------------------------------------------- recovery
 
-    /// Take back up to `limit` jobs whose lease has expired, treating each as
-    /// a failed attempt (retry with backoff, or dead-letter when exhausted).
-    ///
     /// One statement. `SKIP LOCKED` makes each expired lease the business of
-    /// exactly one reaper, so any number of scheduler processes may run this
-    /// concurrently. The worker that lost the lease is fenced off by the
-    /// state change itself: its claim no longer matches a running row.
-    pub async fn reap_expired(&self, limit: u32) -> Result<Reaped, StoreError> {
+    /// exactly one reaper, so any number of processes may run this
+    /// concurrently. The worker that lost the lease is fenced off by the state
+    /// change itself: its claim no longer matches a running row.
+    async fn reap_expired(&self, limit: u32) -> Result<Reaped, StoreError> {
+        // `FOR UPDATE` cannot be combined with a window function, so rows are
+        // locked first and numbered in a second step. The number picks each
+        // row's own jitter sample out of the array.
         let sql = failure_sql(
             r#"
-            expired AS (
-                SELECT id FROM jobs
+            locked AS (
+                SELECT id, lease_expires_at FROM jobs
                 WHERE state = 'running' AND lease_expires_at < now()
                 ORDER BY lease_expires_at
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
             ),
+            expired AS (
+                SELECT id, row_number() OVER (ORDER BY lease_expires_at, id) AS n FROM locked
+            ),
             "#,
             "FROM expired WHERE j.id = expired.id",
-            ["$2", "$3", "$4", "$5"],
+            ["$2", "$3", "$4", "$5", "($6::float8[])[expired.n]"],
         );
+        let jitters: Vec<f64> = (0..limit).map(|_| self.jitter.sample()).collect();
         let rows = sqlx::query_as::<_, JobRow>(&sql)
             .bind(i64::from(limit))
             .bind("lease expired: the worker stopped renewing it")
             .bind(true)
             .bind(self.retry.ceilings_secs(MAX_MAX_ATTEMPTS))
             .bind(AttemptOutcome::LeaseExpired.as_str())
+            .bind(jitters)
             .fetch_all(&self.pool)
             .await?;
 
@@ -608,24 +490,14 @@ impl JobStore {
                 job_id = %job.id, attempt = job.attempt, failures = job.failures,
                 now = %job.state, "lease expired; job taken back from its worker"
             );
-            match job.state {
-                JobState::Queued => reaped.requeued += 1,
-                JobState::Dead => reaped.dead += 1,
-                _ => reaped.cancelled += 1,
-            }
+            reaped.count(job.state);
         }
         Ok(reaped)
     }
 
     // ----------------------------------------------------------- user actions
 
-    /// Ask for a job to be cancelled.
-    ///
-    /// A queued job is cancelled on the spot. A running job cannot be stopped
-    /// from here, so the request is recorded for its worker; whichever commits
-    /// first - the worker's result or its acknowledgement of the cancellation
-    /// - decides the final state, and the other is rejected.
-    pub async fn request_cancel(&self, id: JobId) -> Result<CancelOutcome, StoreError> {
+    async fn request_cancel(&self, id: JobId) -> Result<CancelOutcome, StoreError> {
         let row = sqlx::query_as::<_, JobRow>(
             r#"
             UPDATE jobs
@@ -645,16 +517,10 @@ impl JobStore {
             Some(row) => Job::try_from(row)?,
             None => self.get(id).await?.ok_or(StoreError::NotFound(id))?,
         };
-        Ok(match job.state {
-            JobState::Cancelled => CancelOutcome::Cancelled(job),
-            JobState::Queued | JobState::Running => CancelOutcome::Requested(job),
-            JobState::Succeeded | JobState::Dead => CancelOutcome::AlreadyFinished(job),
-        })
+        Ok(cancel_outcome(job))
     }
 
-    /// Operator re-drive: put a dead-lettered job back in the queue with a
-    /// fresh failure budget (`dead -> queued`).
-    pub async fn redrive(&self, id: JobId) -> Result<Job, StoreError> {
+    async fn redrive(&self, id: JobId) -> Result<Job, StoreError> {
         let row = sqlx::query_as::<_, JobRow>(
             r#"
             UPDATE jobs
@@ -677,21 +543,84 @@ impl JobStore {
             action: "retry",
         })
     }
+
+    async fn purge_finished(&self, older_than: Duration, limit: u32) -> Result<u64, StoreError> {
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM jobs
+            WHERE id IN (
+                SELECT id FROM jobs
+                WHERE finished_at < now() - make_interval(secs => $1::float8)
+                ORDER BY finished_at
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            "#,
+        )
+        .bind(older_than.as_secs_f64())
+        .bind(i64::from(limit))
+        .execute(&self.pool)
+        .await?;
+        Ok(deleted.rows_affected())
+    }
+
+    async fn stats(&self) -> Result<QueueStats, StoreError> {
+        let counts: Vec<(String, String, i64)> =
+            sqlx::query_as("SELECT queue, state, count(*) FROM jobs GROUP BY queue, state")
+                .fetch_all(&self.pool)
+                .await?;
+        let (oldest_due_secs, expired_leases): (f64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+                COALESCE((SELECT extract(epoch FROM now() - min(run_at))::float8
+                          FROM jobs WHERE state = 'queued' AND run_at <= now()), 0),
+                (SELECT count(*) FROM jobs
+                 WHERE state = 'running' AND lease_expires_at < now())
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let counts = counts
+            .into_iter()
+            .map(|(queue, state, n)| {
+                let state = state
+                    .parse()
+                    .map_err(|e| StoreError::Corrupt(format!("stats: {e}")))?;
+                Ok((queue, state, n))
+            })
+            .collect::<Result<_, StoreError>>()?;
+        Ok(QueueStats {
+            counts,
+            oldest_due_secs,
+            expired_leases,
+        })
+    }
+}
+
+pub(crate) fn cancel_outcome(job: Job) -> CancelOutcome {
+    match job.state {
+        JobState::Cancelled => CancelOutcome::Cancelled(job),
+        JobState::Queued | JobState::Running => CancelOutcome::Requested(job),
+        JobState::Succeeded | JobState::Dead => CancelOutcome::AlreadyFinished(job),
+    }
 }
 
 /// The statement that ends an attempt in failure. Shared by `fail` (one job,
 /// fenced by its claim) and the reaper (a batch of expired leases), so both
-/// apply exactly the same retry rules.
+/// apply exactly the same rules.
 ///
-/// `params` are the placeholders for, in order: error text, retryable flag,
-/// backoff ceilings in seconds indexed by failure count, and the attempt
-/// outcome label.
+/// It is `decide_failure` from the domain crate written in SQL: the CASE
+/// order (cancelled, then retry, then dead) and the delay
+/// `ceiling(failures) * (0.5 + 0.5 * jitter)` match it exactly. Doing the
+/// arithmetic here rather than in Rust keeps each transition a single
+/// statement - no read-modify-write - and the conformance tests check that
+/// this store and the in-memory store agree.
 ///
-/// The delay is `ceiling * (0.5 + 0.5 * random())`: the equal-jitter formula
-/// of `RetryPolicy::delay`, evaluated per row so that jobs rescheduled by one
-/// statement do not all come back at the same instant.
-fn failure_sql(leading_cte: &str, target: &str, params: [&str; 4]) -> String {
-    let [error, retryable, ceilings, outcome] = params;
+/// `params` are the SQL expressions for, in order: error text, retryable
+/// flag, backoff ceilings in seconds indexed by failure count, attempt
+/// outcome label, and the jitter sample in `[0, 1)`.
+fn failure_sql(leading_cte: &str, target: &str, params: [&str; 5]) -> String {
+    let [error, retryable, ceilings, outcome, jitter] = params;
     let will_retry = format!(
         "(NOT j.cancel_requested AND {retryable}::bool AND j.failures + 1 < j.max_attempts)"
     );
@@ -705,7 +634,7 @@ fn failure_sql(leading_cte: &str, target: &str, params: [&str; 4]) -> String {
                              ELSE 'dead' END,
                 run_at = CASE WHEN {will_retry}
                               THEN now() + make_interval(secs =>
-                                   ({ceilings}::float8[])[j.failures + 1] * (0.5 + 0.5 * random()))
+                                   ({ceilings}::float8[])[j.failures + 1] * (0.5 + 0.5 * {jitter}))
                               ELSE j.run_at END,
                 finished_at = CASE WHEN {will_retry} THEN NULL ELSE now() END,
                 last_error = {error}::text, lease_owner = NULL, lease_expires_at = NULL
@@ -724,18 +653,6 @@ fn failure_sql(leading_cte: &str, target: &str, params: [&str; 4]) -> String {
     )
 }
 
-/// Cut `s` to at most `max` bytes without splitting a UTF-8 character.
-fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
 #[derive(sqlx::FromRow)]
 struct JobRow {
     id: Uuid,
@@ -748,7 +665,9 @@ struct JobRow {
     attempt: i32,
     failures: i32,
     max_attempts: i32,
+    timeout_secs: i32,
     idempotency_key: Option<String>,
+    request_hash: Option<String>,
     cancel_requested: bool,
     lease_owner: Option<String>,
     lease_expires_at: Option<DateTime<Utc>>,
@@ -779,7 +698,9 @@ impl TryFrom<JobRow> for Job {
             attempt: row.attempt,
             failures: row.failures,
             max_attempts: row.max_attempts,
+            timeout_secs: row.timeout_secs,
             idempotency_key: row.idempotency_key,
+            request_hash: row.request_hash,
             cancel_requested: row.cancel_requested,
             lease_owner: row.lease_owner,
             lease_expires_at: row.lease_expires_at,
@@ -820,19 +741,5 @@ impl TryFrom<AttemptRow> for JobAttempt {
             outcome,
             error: row.error,
         })
-    }
-}
-
-#[cfg(test)]
-mod unit_tests {
-    use super::truncate;
-
-    #[test]
-    fn truncate_respects_char_boundaries() {
-        assert_eq!(truncate("hello", 10), "hello");
-        assert_eq!(truncate("hello", 3), "hel");
-        // 'é' is two bytes; cutting inside it backs off to the boundary.
-        assert_eq!(truncate("né", 2), "n");
-        assert_eq!(truncate("né", 3), "né");
     }
 }

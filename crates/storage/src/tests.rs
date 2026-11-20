@@ -11,7 +11,7 @@ use serde_json::json;
 use sqlx::PgPool;
 use taskforge_domain::{JobId, JobState, JobSubmission, NewJob};
 
-use crate::{Claim, JobStore, StoreError};
+use crate::{Claim, JobStore, PgJobStore, StoreError};
 
 const LEASE: Duration = Duration::from_secs(60);
 
@@ -30,7 +30,7 @@ fn new_job(edit: impl FnOnce(&mut JobSubmission)) -> NewJob {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn insert_then_get_round_trips(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let new = new_job(|s| {
         s.payload = Some(json!({"to": "a@example.com", "n": 3}));
         s.priority = Some(7);
@@ -53,7 +53,7 @@ async fn insert_then_get_round_trips(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn delayed_job_is_not_claimable_before_run_at(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let later = store
         .insert(&new_job(|s| s.delay_ms = Some(3_600_000)))
         .await
@@ -83,7 +83,7 @@ async fn delayed_job_is_not_claimable_before_run_at(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn claims_follow_priority_then_age_within_requested_queues(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let old_low = store.insert(&new_job(|_| {})).await.unwrap();
     let new_low = store.insert(&new_job(|_| {})).await.unwrap();
     let high = store
@@ -113,7 +113,7 @@ async fn claims_follow_priority_then_age_within_requested_queues(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn claim_marks_running_and_issues_a_lease_and_fencing_token(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let job = store.insert(&new_job(|_| {})).await.unwrap();
 
     let claimed = store
@@ -148,7 +148,7 @@ async fn concurrent_claimers_never_receive_the_same_job(pool: PgPool) {
     const JOBS: usize = 60;
     const WORKERS: usize = 12;
 
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     for _ in 0..JOBS {
         store.insert(&new_job(|_| {})).await.unwrap();
     }
@@ -181,7 +181,7 @@ async fn concurrent_claimers_never_receive_the_same_job(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn complete_commits_the_result_and_releases_the_lease(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     store.insert(&new_job(|_| {})).await.unwrap();
     let claimed = store
         .claim_next("w1", &queues(), LEASE)
@@ -202,7 +202,7 @@ async fn complete_commits_the_result_and_releases_the_lease(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn fail_dead_letters_the_job_with_a_bounded_error(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     store.insert(&new_job(|_| {})).await.unwrap();
     let claimed = store
         .claim_next("w1", &queues(), LEASE)
@@ -224,7 +224,7 @@ async fn fail_dead_letters_the_job_with_a_bounded_error(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn stale_or_foreign_claims_cannot_settle_a_job(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let job = store.insert(&new_job(|_| {})).await.unwrap();
     let claimed = store
         .claim_next("w1", &queues(), LEASE)
@@ -280,7 +280,7 @@ async fn stale_or_foreign_claims_cannot_settle_a_job(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn a_settled_job_cannot_be_settled_again(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     store.insert(&new_job(|_| {})).await.unwrap();
     let claimed = store
         .claim_next("w1", &queues(), LEASE)
@@ -307,7 +307,7 @@ async fn a_settled_job_cannot_be_settled_again(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn settling_a_missing_job_is_not_found(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let ghost = Claim {
         job_id: JobId::new(),
         worker_id: "w1".to_owned(),
@@ -343,7 +343,7 @@ async fn force_state(pool: &PgPool, id: JobId, state: JobState) -> Result<(), sq
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn database_trigger_enforces_exactly_the_domain_state_machine(pool: PgPool) {
     use JobState::*;
-    let store = JobStore::new(pool.clone());
+    let store = PgJobStore::new(pool.clone());
 
     for from in JobState::ALL {
         // A legal path from `queued` to the starting state.
@@ -377,7 +377,7 @@ async fn database_trigger_enforces_exactly_the_domain_state_machine(pool: PgPool
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn database_rejects_inconsistent_rows(pool: PgPool) {
-    let store = JobStore::new(pool.clone());
+    let store = PgJobStore::new(pool.clone());
     let job = store.insert(&new_job(|_| {})).await.unwrap();
     let id = job.id.as_uuid();
 

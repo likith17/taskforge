@@ -54,11 +54,13 @@ impl StoreError {
                 | sqlx::Error::PoolClosed
                 | sqlx::Error::WorkerCrashed,
             ) => true,
-            // SQLSTATE class 08 = connection exception, 57P = operator
-            // intervention (server shutting down, connection terminated).
-            StoreError::Database(sqlx::Error::Database(db)) => db
-                .code()
-                .is_some_and(|code| code.starts_with("08") || code.starts_with("57P")),
+            // SQLSTATE class 08 = connection exception; 57P = operator
+            // intervention (server shutting down, connection terminated);
+            // 57014 = query cancelled, which is how `statement_timeout`
+            // reports a statement that ran too long.
+            StoreError::Database(sqlx::Error::Database(db)) => db.code().is_some_and(|code| {
+                code.starts_with("08") || code.starts_with("57P") || code == "57014"
+            }),
             _ => false,
         }
     }

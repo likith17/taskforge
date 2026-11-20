@@ -10,7 +10,7 @@ use taskforge_domain::{
     AttemptOutcome, IdempotencyKey, JobId, JobState, JobSubmission, NewJob, RetryPolicy,
 };
 
-use crate::{CancelOutcome, Claim, JobStore, ListFilter, StoreError, Submitted};
+use crate::{CancelOutcome, Claim, JobStore, ListFilter, PgJobStore, StoreError, Submitted};
 
 const LEASE: Duration = Duration::from_secs(60);
 
@@ -49,7 +49,7 @@ async fn make_due(pool: &PgPool) {
         .unwrap();
 }
 
-async fn claim_one(store: &JobStore, worker: &str) -> Claim {
+async fn claim_one(store: &PgJobStore, worker: &str) -> Claim {
     store
         .claim_next(worker, &queues(), LEASE)
         .await
@@ -58,7 +58,7 @@ async fn claim_one(store: &JobStore, worker: &str) -> Claim {
         .claim
 }
 
-async fn outcomes(store: &JobStore, id: JobId) -> Vec<Option<AttemptOutcome>> {
+async fn outcomes(store: &PgJobStore, id: JobId) -> Vec<Option<AttemptOutcome>> {
     store
         .attempts(id)
         .await
@@ -72,7 +72,7 @@ async fn outcomes(store: &JobStore, id: JobId) -> Vec<Option<AttemptOutcome>> {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn same_key_and_request_returns_the_original_job(pool: PgPool) {
-    let store = JobStore::new(pool.clone());
+    let store = PgJobStore::new(pool.clone());
     let payload = json!({"order": 8841});
 
     let first = store
@@ -111,7 +111,7 @@ async fn same_key_and_request_returns_the_original_job(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn same_key_with_a_different_request_is_rejected(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     store
         .submit(&keyed("k", |s| s.payload = Some(json!({"amount": 100}))))
         .await
@@ -150,7 +150,7 @@ async fn same_key_with_a_different_request_is_rejected(pool: PgPool) {
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn duplicate_submission_storm_creates_exactly_one_job(pool: PgPool) {
     const CLIENTS: usize = 40;
-    let store = JobStore::new(pool.clone());
+    let store = PgJobStore::new(pool.clone());
 
     let mut tasks = Vec::new();
     for _ in 0..CLIENTS {
@@ -184,7 +184,7 @@ async fn duplicate_submission_storm_creates_exactly_one_job(pool: PgPool) {
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn retryable_failure_requeues_with_jittered_exponential_backoff(pool: PgPool) {
     let policy = RetryPolicy::new(Duration::from_secs(10), Duration::from_secs(25));
-    let store = JobStore::new(pool.clone()).with_retry_policy(policy);
+    let store = PgJobStore::new(pool.clone()).with_retry_policy(policy);
     let job = store
         .insert(&new_job(|s| s.max_attempts = Some(10)))
         .await
@@ -222,7 +222,7 @@ async fn retryable_failure_requeues_with_jittered_exponential_backoff(pool: PgPo
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn retries_are_spread_out_not_synchronised(pool: PgPool) {
     let policy = RetryPolicy::new(Duration::from_secs(100), Duration::from_secs(100));
-    let store = JobStore::new(pool.clone()).with_retry_policy(policy);
+    let store = PgJobStore::new(pool.clone()).with_retry_policy(policy);
     for _ in 0..20 {
         store.insert(&new_job(|_| {})).await.unwrap();
     }
@@ -241,7 +241,7 @@ async fn retries_are_spread_out_not_synchronised(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn exhausted_retries_dead_letter_and_an_operator_can_redrive(pool: PgPool) {
-    let store = JobStore::new(pool.clone());
+    let store = PgJobStore::new(pool.clone());
     let job = store
         .insert(&new_job(|s| s.max_attempts = Some(3)))
         .await
@@ -301,7 +301,7 @@ async fn exhausted_retries_dead_letter_and_an_operator_can_redrive(pool: PgPool)
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn non_retryable_failure_skips_the_remaining_budget(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let job = store
         .insert(&new_job(|s| s.max_attempts = Some(10)))
         .await
@@ -321,7 +321,7 @@ async fn non_retryable_failure_skips_the_remaining_budget(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn expired_lease_is_recovered_and_the_zombie_worker_is_fenced_off(pool: PgPool) {
-    let store = JobStore::new(pool.clone());
+    let store = PgJobStore::new(pool.clone());
     let job = store.insert(&new_job(|_| {})).await.unwrap();
     let zombie = claim_one(&store, "w1").await;
 
@@ -395,7 +395,7 @@ async fn expired_lease_is_recovered_and_the_zombie_worker_is_fenced_off(pool: Pg
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn concurrent_reapers_recover_each_lease_exactly_once(pool: PgPool) {
     const JOBS: u32 = 30;
-    let store = JobStore::new(pool.clone());
+    let store = PgJobStore::new(pool.clone());
     for _ in 0..JOBS {
         store.insert(&new_job(|_| {})).await.unwrap();
     }
@@ -436,7 +436,7 @@ async fn concurrent_reapers_recover_each_lease_exactly_once(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn a_job_that_keeps_killing_its_workers_is_eventually_dead_lettered(pool: PgPool) {
-    let store = JobStore::new(pool.clone());
+    let store = PgJobStore::new(pool.clone());
     let job = store
         .insert(&new_job(|s| s.max_attempts = Some(2)))
         .await
@@ -457,7 +457,7 @@ async fn a_job_that_keeps_killing_its_workers_is_eventually_dead_lettered(pool: 
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn heartbeat_renews_held_leases_and_reports_lost_and_cancelled_ones(pool: PgPool) {
-    let store = JobStore::new(pool.clone());
+    let store = PgJobStore::new(pool.clone());
     for _ in 0..3 {
         store.insert(&new_job(|_| {})).await.unwrap();
     }
@@ -520,7 +520,7 @@ async fn heartbeat_renews_held_leases_and_reports_lost_and_cancelled_ones(pool: 
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn release_requeues_at_once_without_spending_a_failure(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let job = store
         .insert(&new_job(|s| s.max_attempts = Some(1)))
         .await
@@ -548,7 +548,7 @@ async fn release_requeues_at_once_without_spending_a_failure(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn cancelling_a_queued_job_is_immediate_and_repeatable(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let job = store.insert(&new_job(|_| {})).await.unwrap();
 
     let CancelOutcome::Cancelled(cancelled) = store.request_cancel(job.id).await.unwrap() else {
@@ -586,7 +586,7 @@ async fn cancelling_a_queued_job_is_immediate_and_repeatable(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn cancelling_a_running_job_waits_for_the_worker_to_acknowledge(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let job = store.insert(&new_job(|_| {})).await.unwrap();
     let claim = claim_one(&store, "w1").await;
 
@@ -631,7 +631,7 @@ async fn cancelling_a_running_job_waits_for_the_worker_to_acknowledge(pool: PgPo
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn a_result_committed_before_the_acknowledgement_wins(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let job = store.insert(&new_job(|_| {})).await.unwrap();
     let claim = claim_one(&store, "w1").await;
     store.request_cancel(job.id).await.unwrap();
@@ -655,7 +655,7 @@ async fn a_result_committed_before_the_acknowledgement_wins(pool: PgPool) {
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn a_cancelled_job_is_not_retried_when_its_attempt_fails_or_expires(pool: PgPool) {
-    let store = JobStore::new(pool.clone());
+    let store = PgJobStore::new(pool.clone());
 
     let failing = store.insert(&new_job(|_| {})).await.unwrap();
     let claim = claim_one(&store, "w1").await;
@@ -684,7 +684,7 @@ async fn a_cancelled_job_is_not_retried_when_its_attempt_fails_or_expires(pool: 
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn cancel_racing_completion_ends_in_exactly_one_final_state(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
 
     for round in 0..40 {
         let job = store.insert(&new_job(|_| {})).await.unwrap();
@@ -735,7 +735,7 @@ async fn cancel_racing_completion_ends_in_exactly_one_final_state(pool: PgPool) 
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn cancel_racing_a_claim_never_leaves_a_cancelled_job_running(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
 
     for round in 0..40 {
         let job = store.insert(&new_job(|_| {})).await.unwrap();
@@ -766,7 +766,7 @@ async fn cancel_racing_a_claim_never_leaves_a_cancelled_job_running(pool: PgPool
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn list_filters_and_pages_newest_first(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let mut ids = Vec::new();
     for i in 0..7 {
         let job = store
