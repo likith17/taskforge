@@ -472,7 +472,8 @@ async fn several_workers_share_a_queue_without_running_anything_twice(pool: PgPo
         worker.shutdown().await;
     }
 
-    let executed = executed.lock().unwrap();
+    // Copy out, so no lock is held across the `.await` below.
+    let executed = executed.lock().unwrap().clone();
     assert_eq!(
         executed.len(),
         JOBS,

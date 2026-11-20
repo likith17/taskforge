@@ -117,7 +117,8 @@ async fn same_key_with_a_different_request_is_rejected(pool: PgPool) {
         .await
         .unwrap();
 
-    let different: [Box<dyn FnOnce(&mut JobSubmission)>; 4] = [
+    type Edit = Box<dyn FnOnce(&mut JobSubmission)>;
+    let different: [Edit; 4] = [
         Box::new(|s| s.payload = Some(json!({"amount": 999}))),
         Box::new(|s| {
             s.payload = Some(json!({"amount": 100}));
