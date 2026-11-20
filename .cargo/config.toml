@@ -1,0 +1,9 @@
+# Local-development default so `cargo test` and `cargo run` work out of the box
+# against the Postgres from docker-compose.yml. These are throwaway dev
+# credentials, not a secret; a real DATABASE_URL in the environment wins.
+[env]
+#
+# 127.0.0.1, not "localhost": the container port is published on IPv4 loopback
+# only, and on Windows a "localhost" connection tries ::1 first and waits about
+# two seconds before falling back. See docs/FAILURE_ANALYSIS.md.
+DATABASE_URL = { value = "postgres://taskforge:taskforge@127.0.0.1:5434/taskforge", force = false }

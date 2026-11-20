@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3" # MSRV-aware: picks dependency versions that build on `rust-version`
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+taskforge-domain = { path = "crates/domain" }
+taskforge-storage = { path = "crates/storage" }
+taskforge-api = { path = "crates/api" }
+taskforge-worker = { path = "crates/worker" }
+taskforge-scheduler = { path = "crates/scheduler" }
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "net"] }
+axum = { version = "0.8", features = ["macros"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "uuid",
+    "chrono",
+    "json",
+    "migrate",
+    "macros",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = "1"
+
+# test-only
+proptest = { version = "1", default-features = false, features = ["std"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

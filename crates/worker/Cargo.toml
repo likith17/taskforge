@@ -1,0 +1,23 @@
+[package]
+name = "taskforge-worker"
+description = "Worker runtime for TaskForge: claims jobs and runs registered handlers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+taskforge-domain.workspace = true
+taskforge-storage.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+taskforge-scheduler.workspace = true
+sqlx.workspace = true
+tokio = { workspace = true, features = ["test-util"] } # paused clock for the sleep handler test
+
+[lints]
+workspace = true
