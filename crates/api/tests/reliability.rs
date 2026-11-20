@@ -10,7 +10,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use taskforge_api::{ApiConfig, router};
-use taskforge_storage::JobStore;
+use taskforge_storage::{JobStore, PgJobStore};
 use tower::ServiceExt;
 
 const LEASE: Duration = Duration::from_secs(60);
@@ -76,7 +76,7 @@ async fn new_job(app: &Router, body: Value) -> String {
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn idempotency_key_makes_a_retried_submission_safe(pool: PgPool) {
-    let app = router(JobStore::new(pool.clone()), ApiConfig::default());
+    let app = router(PgJobStore::new(pool.clone()), ApiConfig::default());
     let body = json!({"kind": "echo", "payload": {"charge": 500}});
 
     let first = send(&app, submit(&body, Some("order-8841"))).await;
@@ -110,7 +110,7 @@ async fn idempotency_key_makes_a_retried_submission_safe(pool: PgPool) {
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn concurrent_duplicate_requests_create_one_job(pool: PgPool) {
-    let app = router(JobStore::new(pool.clone()), ApiConfig::default());
+    let app = router(PgJobStore::new(pool.clone()), ApiConfig::default());
     let body = json!({"kind": "echo"});
 
     let mut requests = Vec::new();
@@ -139,7 +139,7 @@ async fn concurrent_duplicate_requests_create_one_job(pool: PgPool) {
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn max_attempts_is_accepted_and_validated(pool: PgPool) {
-    let app = router(JobStore::new(pool), ApiConfig::default());
+    let app = router(PgJobStore::new(pool), ApiConfig::default());
 
     let created = send(
         &app,
@@ -164,7 +164,7 @@ async fn max_attempts_is_accepted_and_validated(pool: PgPool) {
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn list_filters_validates_and_paginates(pool: PgPool) {
-    let app = router(JobStore::new(pool), ApiConfig::default());
+    let app = router(PgJobStore::new(pool), ApiConfig::default());
     let mut ids = Vec::new();
     for i in 0..5 {
         let kind = if i % 2 == 0 { "echo" } else { "sum" };
@@ -219,7 +219,7 @@ async fn list_filters_validates_and_paginates(pool: PgPool) {
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn cancel_reports_what_actually_happened(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let app = router(store.clone(), ApiConfig::default());
 
     // Queued: cancelled now. Repeating the request is harmless.
@@ -267,7 +267,7 @@ async fn cancel_reports_what_actually_happened(pool: PgPool) {
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn retry_redrives_only_dead_jobs_and_attempts_show_the_history(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let app = router(store.clone(), ApiConfig::default());
     let id = new_job(&app, json!({"kind": "echo", "max_attempts": 1})).await;
 

@@ -1,0 +1,15 @@
+[package]
+name = "taskforge-metrics"
+description = "Prometheus metrics for TaskForge."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+taskforge-storage.workspace = true
+prometheus-client.workspace = true
+
+[lints]
+workspace = true

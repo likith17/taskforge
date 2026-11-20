@@ -77,6 +77,7 @@ mod tests {
             kind: kind.to_owned(),
             queue: "default".to_owned(),
             attempt: 1,
+            worker_id: "test".to_owned(),
         }
     }
 

@@ -9,13 +9,13 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use taskforge_api::{ApiConfig, router};
-use taskforge_storage::JobStore;
+use taskforge_storage::{MemJobStore, PgJobStore};
 use tower::ServiceExt;
 
 fn app(pool: PgPool) -> Router {
     let known_kinds = BTreeSet::from(["echo".to_owned(), "sum".to_owned()]);
     router(
-        JobStore::new(pool),
+        PgJobStore::new(pool),
         ApiConfig {
             known_kinds: Some(known_kinds),
             ..ApiConfig::default()
@@ -226,4 +226,53 @@ async fn health_endpoints(pool: PgPool) {
     let submit = send(&app, post_json(&json!({"kind": "echo"}))).await;
     assert_eq!(submit.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(submit.retry_after.as_deref(), Some("1"));
+}
+
+#[tokio::test]
+async fn the_api_runs_unchanged_on_the_in_memory_store() {
+    // No database: the router is generic over JobStore.
+    let app = router(MemJobStore::default(), ApiConfig::default());
+    let created = send(
+        &app,
+        post_json(&json!({"kind": "echo", "payload": {"x": 1}})),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    let fetched = send(&app, get(created.location.as_deref().unwrap())).await;
+    assert_eq!(fetched.body, created.body);
+    assert_eq!(send(&app, get("/readyz")).await.status, StatusCode::OK);
+}
+
+#[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
+async fn metrics_expose_counters_and_queue_gauges(pool: PgPool) {
+    let app = app(pool);
+    send(&app, post_json(&json!({"kind": "echo"}))).await;
+    send(&app, post_json(&json!({"kind": "sum"}))).await;
+
+    let response = app.clone().oneshot(get("/metrics")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/openmetrics-text")
+    );
+    let text = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    for expected in [
+        r#"taskforge_submissions_total{result="created"} 2"#,
+        r#"taskforge_jobs{queue="default",state="queued"} 2"#,
+        "taskforge_expired_unreaped_leases 0",
+        "# EOF",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+    }
 }

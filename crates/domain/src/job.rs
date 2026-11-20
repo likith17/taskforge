@@ -612,7 +612,9 @@ mod tests {
         assert_ne!(a.id(), b.id(), "still two distinct submissions");
 
         // The schedule is not part of the request's identity.
-        let delayed = from_json(r#"{"kind":"echo","payload":{"a":1,"b":{"x":[1,2],"y":null}},"delay_ms":500}"#);
+        let delayed = from_json(
+            r#"{"kind":"echo","payload":{"a":1,"b":{"x":[1,2],"y":null}},"delay_ms":500}"#,
+        );
         assert_eq!(a.request_hash(), delayed.request_hash());
 
         // Anything that changes what would run does change the hash.
@@ -625,7 +627,11 @@ mod tests {
             r#"{"kind":"echo","max_attempts":2,"payload":{"a":1,"b":{"x":[1,2],"y":null}}}"#,
             r#"{"kind":"echo","timeout_secs":9,"payload":{"a":1,"b":{"x":[1,2],"y":null}}}"#,
         ] {
-            assert_ne!(a.request_hash(), from_json(different).request_hash(), "{different}");
+            assert_ne!(
+                a.request_hash(),
+                from_json(different).request_hash(),
+                "{different}"
+            );
         }
     }
 

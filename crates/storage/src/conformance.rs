@@ -21,9 +21,7 @@ use taskforge_domain::{
     NewJob, RetryPolicy,
 };
 
-use crate::{
-    CancelOutcome, Claim, JobStore, MemJobStore, PgJobStore, StoreError, Submitted,
-};
+use crate::{CancelOutcome, Claim, JobStore, MemJobStore, PgJobStore, StoreError, Submitted};
 
 const LEASE: Duration = Duration::from_millis(200);
 /// Backoff ceilings of 80 ms, then 160 ms, capped at 320 ms.
@@ -73,7 +71,8 @@ fn pg(pool: PgPool) -> Pg {
 
 fn mem() -> Mem {
     let clock = Arc::new(ManualClock::default());
-    let store = MemJobStore::new(clock.clone(), Arc::new(FixedJitter(JITTER))).with_retry_policy(POLICY);
+    let store =
+        MemJobStore::new(clock.clone(), Arc::new(FixedJitter(JITTER))).with_retry_policy(POLICY);
     Mem { store, clock }
 }
 
@@ -116,7 +115,10 @@ async fn outcomes<S: JobStore>(store: &S, id: JobId) -> Vec<Option<AttemptOutcom
 /// PostgreSQL stores microseconds; allow for rounding.
 fn assert_close(actual: chrono::Duration, expected: Duration, what: &str) {
     let diff = (actual.num_microseconds().unwrap() - expected.as_micros() as i64).abs();
-    assert!(diff <= 2_000, "{what}: got {actual:?}, expected {expected:?}");
+    assert!(
+        diff <= 2_000,
+        "{what}: got {actual:?}, expected {expected:?}"
+    );
 }
 
 // ---------------------------------------------------------------- scenarios
@@ -141,9 +143,22 @@ async fn claim_order_and_due_time(f: &impl Fixture) {
         .iter()
         .map(|c| c.job.id)
         .collect();
-    assert_eq!(first, [high.id, low.id], "priority first; other queue and future job skipped");
-    assert!(s.claim("w2", &queues(), LEASE, 10).await.unwrap().is_empty(), "nothing claimed twice");
-    assert_eq!(s.get(other.id).await.unwrap().unwrap().state, JobState::Queued);
+    assert_eq!(
+        first,
+        [high.id, low.id],
+        "priority first; other queue and future job skipped"
+    );
+    assert!(
+        s.claim("w2", &queues(), LEASE, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing claimed twice"
+    );
+    assert_eq!(
+        s.get(other.id).await.unwrap().unwrap().state,
+        JobState::Queued
+    );
 
     f.pass(Duration::from_millis(350)).await;
     let due = s.claim_next("w2", &queues(), LEASE).await.unwrap().unwrap();
@@ -153,7 +168,11 @@ async fn claim_order_and_due_time(f: &impl Fixture) {
 
 async fn failure_backoff_and_dead_letter(f: &impl Fixture) {
     let s = f.store();
-    let id = s.insert(&job(|j| j.max_attempts = Some(3))).await.unwrap().id;
+    let id = s
+        .insert(&job(|j| j.max_attempts = Some(3)))
+        .await
+        .unwrap()
+        .id;
 
     for n in 1..=2 {
         let claim = claim_one(s, "w1").await;
@@ -162,7 +181,13 @@ async fn failure_backoff_and_dead_letter(f: &impl Fixture) {
         assert_eq!(after.failures, n);
         let expected = POLICY.delay(n as u32, JITTER);
         assert_close(after.run_at - after.updated_at, expected, "retry delay");
-        assert!(s.claim_next("w1", &queues(), LEASE).await.unwrap().is_none(), "not before the backoff");
+        assert!(
+            s.claim_next("w1", &queues(), LEASE)
+                .await
+                .unwrap()
+                .is_none(),
+            "not before the backoff"
+        );
         f.pass(expected + Duration::from_millis(30)).await;
     }
     let claim = claim_one(s, "w1").await;
@@ -184,7 +209,11 @@ async fn lease_expiry_recovers_the_job_and_fences_the_old_worker(f: &impl Fixtur
     let s = f.store();
     let id = s.insert(&job(|_| {})).await.unwrap().id;
     let zombie = claim_one(s, "w1").await;
-    assert_eq!(s.reap_expired(100).await.unwrap().total(), 0, "lease still valid");
+    assert_eq!(
+        s.reap_expired(100).await.unwrap().total(),
+        0,
+        "lease still valid"
+    );
 
     f.pass(LEASE + Duration::from_millis(50)).await;
     let reaped = s.reap_expired(100).await.unwrap();
@@ -204,20 +233,30 @@ async fn lease_expiry_recovers_the_job_and_fences_the_old_worker(f: &impl Fixtur
         s.fail(&zombie, "late", true).await,
         s.release(&zombie).await,
     ] {
-        assert!(matches!(refused, Err(StoreError::StaleClaim { .. })), "{refused:?}");
+        assert!(
+            matches!(refused, Err(StoreError::StaleClaim { .. })),
+            "{refused:?}"
+        );
     }
     let beat = s.heartbeat("w1", &[zombie.clone()], LEASE).await.unwrap();
     assert_eq!(beat.lost, vec![id]);
 
-    f.pass(POLICY.delay(1, JITTER) + Duration::from_millis(30)).await;
+    f.pass(POLICY.delay(1, JITTER) + Duration::from_millis(30))
+        .await;
     let successor = claim_one(s, "w2").await;
     assert_eq!(successor.attempt(), 2);
-    assert!(s.complete(&zombie, &json!("late")).await.is_err(), "still fenced");
+    assert!(
+        s.complete(&zombie, &json!("late")).await.is_err(),
+        "still fenced"
+    );
     let done = s.complete(&successor, &json!("w2")).await.unwrap();
     assert_eq!(done.result, Some(json!("w2")));
     assert_eq!(
         outcomes(s, id).await,
-        [Some(AttemptOutcome::LeaseExpired), Some(AttemptOutcome::Succeeded)]
+        [
+            Some(AttemptOutcome::LeaseExpired),
+            Some(AttemptOutcome::Succeeded)
+        ]
     );
 }
 
@@ -234,7 +273,10 @@ async fn heartbeats_keep_a_lease_alive(f: &impl Fixture) {
     assert_eq!(s.reap_expired(100).await.unwrap().total(), 0);
     assert_eq!(s.get(id).await.unwrap().unwrap().state, JobState::Running);
     // A heartbeat for someone else's claim renews nothing.
-    assert_eq!(s.heartbeat("w2", &[claim], LEASE).await.unwrap().lost, vec![id]);
+    assert_eq!(
+        s.heartbeat("w2", &[claim], LEASE).await.unwrap().lost,
+        vec![id]
+    );
 }
 
 async fn cancellation_rules(f: &impl Fixture) {
@@ -246,19 +288,39 @@ async fn cancellation_rules(f: &impl Fixture) {
         panic!("a queued job is cancelled immediately")
     };
     assert_eq!((c.state, c.attempt), (JobState::Cancelled, 0));
-    assert!(s.claim_next("w1", &queues(), LEASE).await.unwrap().is_none());
+    assert!(
+        s.claim_next("w1", &queues(), LEASE)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Running: requested, seen by the heartbeat, acknowledged by the worker.
     let running = s.insert(&job(|_| {})).await.unwrap();
     let claim = claim_one(s, "w1").await;
-    assert!(matches!(s.acknowledge_cancel(&claim).await, Err(StoreError::StaleClaim { .. })), "nothing to acknowledge yet");
-    assert!(matches!(s.request_cancel(running.id).await.unwrap(), CancelOutcome::Requested(_)));
+    assert!(
+        matches!(
+            s.acknowledge_cancel(&claim).await,
+            Err(StoreError::StaleClaim { .. })
+        ),
+        "nothing to acknowledge yet"
+    );
+    assert!(matches!(
+        s.request_cancel(running.id).await.unwrap(),
+        CancelOutcome::Requested(_)
+    ));
     let beat = s.heartbeat("w1", &[claim.clone()], LEASE).await.unwrap();
     assert_eq!(beat.cancel_requested, vec![running.id]);
     let acked = s.acknowledge_cancel(&claim).await.unwrap();
     assert_eq!((acked.state, acked.failures), (JobState::Cancelled, 0));
-    assert_eq!(outcomes(s, running.id).await, [Some(AttemptOutcome::Cancelled)]);
-    assert!(matches!(s.complete(&claim, &json!(1)).await, Err(StoreError::StaleClaim { .. })));
+    assert_eq!(
+        outcomes(s, running.id).await,
+        [Some(AttemptOutcome::Cancelled)]
+    );
+    assert!(matches!(
+        s.complete(&claim, &json!(1)).await,
+        Err(StoreError::StaleClaim { .. })
+    ));
 
     // The result lands before the acknowledgement: success is final.
     let racing = s.insert(&job(|_| {})).await.unwrap();
@@ -266,23 +328,37 @@ async fn cancellation_rules(f: &impl Fixture) {
     s.request_cancel(racing.id).await.unwrap();
     let done = s.complete(&claim, &json!("made it")).await.unwrap();
     assert_eq!(done.state, JobState::Succeeded);
-    assert!(matches!(s.acknowledge_cancel(&claim).await, Err(StoreError::StaleClaim { .. })));
-    assert!(matches!(s.request_cancel(racing.id).await.unwrap(), CancelOutcome::AlreadyFinished(_)));
+    assert!(matches!(
+        s.acknowledge_cancel(&claim).await,
+        Err(StoreError::StaleClaim { .. })
+    ));
+    assert!(matches!(
+        s.request_cancel(racing.id).await.unwrap(),
+        CancelOutcome::AlreadyFinished(_)
+    ));
 
     // A failure after a cancel request is not retried.
     let failing = s.insert(&job(|_| {})).await.unwrap();
     let claim = claim_one(s, "w1").await;
     s.request_cancel(failing.id).await.unwrap();
-    assert_eq!(s.fail(&claim, "boom", true).await.unwrap().state, JobState::Cancelled);
-    assert_eq!(outcomes(s, failing.id).await, [Some(AttemptOutcome::Cancelled)]);
+    assert_eq!(
+        s.fail(&claim, "boom", true).await.unwrap().state,
+        JobState::Cancelled
+    );
+    assert_eq!(
+        outcomes(s, failing.id).await,
+        [Some(AttemptOutcome::Cancelled)]
+    );
 }
 
 async fn idempotent_submission(f: &impl Fixture) {
     let s = f.store();
     let key = || IdempotencyKey::parse("order-1").unwrap();
 
-    let Submitted::Created(original) =
-        s.submit(&job(|j| j.payload = Some(json!({"amount": 5}))).with_idempotency_key(key())).await.unwrap()
+    let Submitted::Created(original) = s
+        .submit(&job(|j| j.payload = Some(json!({"amount": 5}))).with_idempotency_key(key()))
+        .await
+        .unwrap()
     else {
         panic!("first submission creates")
     };
@@ -299,33 +375,52 @@ async fn idempotent_submission(f: &impl Fixture) {
 
     // Regression test: a retry whose payload the database normalises
     // (1e2 is stored and returned as 100) is still the same request.
-    let sci = || from_json(r#"{"kind":"echo","payload":{"n":1e2}}"#)
-        .with_idempotency_key(IdempotencyKey::parse("sci").unwrap());
+    let sci = || {
+        from_json(r#"{"kind":"echo","payload":{"n":1e2}}"#)
+            .with_idempotency_key(IdempotencyKey::parse("sci").unwrap())
+    };
     let first = s.submit(&sci()).await.unwrap();
     let retry = s.submit(&sci()).await.unwrap();
     assert!(!first.is_duplicate());
-    assert!(retry.is_duplicate(), "a genuine retry must not be called a conflict");
+    assert!(
+        retry.is_duplicate(),
+        "a genuine retry must not be called a conflict"
+    );
     assert_eq!(retry.job().id, first.job().id);
 }
 
 async fn release_and_redrive(f: &impl Fixture) {
     let s = f.store();
-    let id = s.insert(&job(|j| j.max_attempts = Some(1))).await.unwrap().id;
+    let id = s
+        .insert(&job(|j| j.max_attempts = Some(1)))
+        .await
+        .unwrap()
+        .id;
 
     let claim = claim_one(s, "w1").await;
     let released = s.release(&claim).await.unwrap();
-    assert_eq!((released.state, released.failures), (JobState::Queued, 0), "a release is not a failure");
+    assert_eq!(
+        (released.state, released.failures),
+        (JobState::Queued, 0),
+        "a release is not a failure"
+    );
 
     let claim = claim_one(s, "w2").await;
     assert_eq!(claim.attempt(), 2, "the fencing token still moved on");
-    assert_eq!(s.fail(&claim, "boom", true).await.unwrap().state, JobState::Dead);
+    assert_eq!(
+        s.fail(&claim, "boom", true).await.unwrap().state,
+        JobState::Dead
+    );
 
     let revived = s.redrive(id).await.unwrap();
     assert_eq!((revived.state, revived.failures), (JobState::Queued, 0));
     assert!(revived.finished_at.is_none());
     assert!(matches!(
         s.redrive(id).await,
-        Err(StoreError::InvalidState { state: JobState::Queued, .. })
+        Err(StoreError::InvalidState {
+            state: JobState::Queued,
+            ..
+        })
     ));
     assert_eq!(
         outcomes(s, id).await,
@@ -336,31 +431,52 @@ async fn release_and_redrive(f: &impl Fixture) {
 async fn purge_and_stats(f: &impl Fixture) {
     let s = f.store();
     let key = || IdempotencyKey::parse("purge-me").unwrap();
-    let done = s.insert(&job(|_| {}).with_idempotency_key(key())).await.unwrap();
+    let done = s
+        .insert(&job(|_| {}).with_idempotency_key(key()))
+        .await
+        .unwrap();
     let claim = claim_one(s, "w1").await;
     s.complete(&claim, &json!(1)).await.unwrap();
     let waiting = s.insert(&job(|_| {})).await.unwrap();
-    let held = s.insert(&job(|j| j.queue = Some("slow".to_owned()))).await.unwrap();
+    let held = s
+        .insert(&job(|j| j.queue = Some("slow".to_owned())))
+        .await
+        .unwrap();
     s.claim("w2", &["slow".to_owned()], LEASE, 1).await.unwrap();
 
     f.pass(LEASE + Duration::from_millis(100)).await;
     let stats = s.stats().await.unwrap();
     let count = |q: &str, st: JobState| {
-        stats.counts.iter().find(|(qq, ss, _)| qq == q && *ss == st).map_or(0, |c| c.2)
+        stats
+            .counts
+            .iter()
+            .find(|(qq, ss, _)| qq == q && *ss == st)
+            .map_or(0, |c| c.2)
     };
     assert_eq!(count("default", JobState::Succeeded), 1);
     assert_eq!(count("default", JobState::Queued), 1);
     assert_eq!(count("slow", JobState::Running), 1);
-    assert_eq!(stats.expired_leases, 1, "the slow job's lease ran out and nobody reaped it");
+    assert_eq!(
+        stats.expired_leases, 1,
+        "the slow job's lease ran out and nobody reaped it"
+    );
     assert!(stats.oldest_due_secs >= 0.25, "{}", stats.oldest_due_secs);
 
     // Only finished jobs older than the cutoff go; their keys become free.
-    assert_eq!(s.purge_finished(Duration::from_millis(200), 100).await.unwrap(), 1);
+    assert_eq!(
+        s.purge_finished(Duration::from_millis(200), 100)
+            .await
+            .unwrap(),
+        1
+    );
     assert!(s.get(done.id).await.unwrap().is_none());
     assert!(s.attempts(done.id).await.unwrap().is_empty());
     assert!(s.get(waiting.id).await.unwrap().is_some());
     assert!(s.get(held.id).await.unwrap().is_some());
-    let reused = s.submit(&job(|_| {}).with_idempotency_key(key())).await.unwrap();
+    let reused = s
+        .submit(&job(|_| {}).with_idempotency_key(key()))
+        .await
+        .unwrap();
     assert!(!reused.is_duplicate());
 }
 

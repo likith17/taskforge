@@ -426,7 +426,11 @@ impl JobStore for MemJobStore {
             .jobs
             .values()
             .filter(|j| j.state == JobState::Running)
-            .filter_map(|j| j.lease_expires_at.filter(|at| *at < now).map(|at| (at, j.id)))
+            .filter_map(|j| {
+                j.lease_expires_at
+                    .filter(|at| *at < now)
+                    .map(|at| (at, j.id))
+            })
             .collect();
         expired.sort();
 
@@ -487,7 +491,8 @@ impl JobStore for MemJobStore {
     }
 
     async fn purge_finished(&self, older_than: Duration, limit: u32) -> Result<u64, StoreError> {
-        let cutoff = self.now() - chrono::Duration::from_std(older_than).unwrap_or(chrono::Duration::MAX);
+        let cutoff =
+            self.now() - chrono::Duration::from_std(older_than).unwrap_or(chrono::Duration::MAX);
         let mut state = self.lock();
         let mut old: Vec<(DateTime<Utc>, JobId)> = state
             .jobs
@@ -531,7 +536,8 @@ impl JobStore for MemJobStore {
                 .into_iter()
                 .map(|((queue, _), (state, n))| (queue, state, n))
                 .collect(),
-            oldest_due_secs: oldest_due.map_or(0.0, |at| (now - at).num_milliseconds() as f64 / 1000.0),
+            oldest_due_secs: oldest_due
+                .map_or(0.0, |at| (now - at).num_milliseconds() as f64 / 1000.0),
             expired_leases,
         })
     }

@@ -20,7 +20,7 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use taskforge_domain::{AttemptOutcome, JobId, JobState};
 use taskforge_scheduler::{Reaper, ReaperConfig};
-use taskforge_storage::JobStore;
+use taskforge_storage::{JobStore, PgJobStore};
 use taskforge_worker::{HandlerError, HandlerRegistry, JobContext, Worker, WorkerConfig};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
@@ -35,12 +35,13 @@ fn short_lease(worker_id: &str) -> WorkerConfig {
 }
 
 /// A reaper checking every 25 ms, stopped when the returned sender is dropped.
-fn start_reaper(store: &JobStore) -> (watch::Sender<bool>, JoinHandle<()>) {
+fn start_reaper(store: &PgJobStore) -> (watch::Sender<bool>, JoinHandle<()>) {
     let reaper = Reaper::new(
         store.clone(),
         ReaperConfig {
             interval: Duration::from_millis(25),
             batch: 100,
+            ..ReaperConfig::default()
         },
     );
     let (stop, stopped) = watch::channel(false);
@@ -75,7 +76,7 @@ fn finishes_as(name: &'static str) -> HandlerRegistry {
     })
 }
 
-async fn attempt_log(store: &JobStore, id: JobId) -> Vec<(String, Option<AttemptOutcome>)> {
+async fn attempt_log(store: &PgJobStore, id: JobId) -> Vec<(String, Option<AttemptOutcome>)> {
     store
         .attempts(id)
         .await
@@ -87,7 +88,7 @@ async fn attempt_log(store: &JobStore, id: JobId) -> Vec<(String, Option<Attempt
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn runs_jobs_concurrently_but_never_more_than_the_limit(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let running = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     let registry = {
@@ -132,7 +133,7 @@ async fn runs_jobs_concurrently_but_never_more_than_the_limit(pool: PgPool) {
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn transient_failures_are_retried_until_the_job_succeeds(pool: PgPool) {
-    let store = fast_retries(JobStore::new(pool));
+    let store = fast_retries(PgJobStore::new(pool));
     let registry =
         HandlerRegistry::new().register("flaky", |ctx: JobContext, _payload: Value| async move {
             if ctx.attempt < 3 {
@@ -167,7 +168,7 @@ async fn transient_failures_are_retried_until_the_job_succeeds(pool: PgPool) {
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn a_job_that_always_fails_is_dead_lettered_after_max_attempts(pool: PgPool) {
-    let store = fast_retries(JobStore::new(pool));
+    let store = fast_retries(PgJobStore::new(pool));
     let runs = Arc::new(AtomicUsize::new(0));
     let registry = {
         let runs = runs.clone();
@@ -199,7 +200,7 @@ async fn a_job_that_always_fails_is_dead_lettered_after_max_attempts(pool: PgPoo
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn heartbeats_keep_a_long_job_leased_well_past_one_lease(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let (_stop_reaper, _reaper) = start_reaper(&store);
     let runs = Arc::new(AtomicUsize::new(0));
     let registry = {
@@ -227,7 +228,7 @@ async fn heartbeats_keep_a_long_job_leased_well_past_one_lease(pool: PgPool) {
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn a_crashed_workers_job_is_recovered_and_finished_by_another(pool: PgPool) {
-    let store = fast_retries(JobStore::new(pool));
+    let store = fast_retries(PgJobStore::new(pool));
     let started = Arc::new(Notify::new());
     let torn_down = Arc::new(AtomicBool::new(false));
     let job = submit(&store, "job", json!({})).await;
@@ -281,14 +282,14 @@ async fn a_crashed_workers_job_is_recovered_and_finished_by_another(pool: PgPool
 async fn a_worker_that_cannot_renew_its_lease_stops_itself(pool: PgPool) {
     // A partitioned worker: alive and running the handler, but cut off from
     // the database. It must not keep working alongside its replacement.
-    let store = fast_retries(JobStore::new(pool.clone()));
+    let store = fast_retries(PgJobStore::new(pool.clone()));
     let partitioned_pool = PgPoolOptions::new()
         .max_connections(4)
         .acquire_timeout(Duration::from_millis(200))
         .connect_with((*pool.connect_options()).clone())
         .await
         .unwrap();
-    let partitioned_store = fast_retries(JobStore::new(partitioned_pool.clone()));
+    let partitioned_store = fast_retries(PgJobStore::new(partitioned_pool.clone()));
 
     let started = Arc::new(Notify::new());
     let torn_down = Arc::new(AtomicBool::new(false));
@@ -338,7 +339,7 @@ async fn a_worker_that_cannot_renew_its_lease_stops_itself(pool: PgPool) {
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn cancelling_a_running_job_stops_its_handler(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let started = Arc::new(Notify::new());
     let torn_down = Arc::new(AtomicBool::new(false));
     let job = submit(&store, "job", json!({})).await;
@@ -367,7 +368,7 @@ async fn cancelling_a_running_job_stops_its_handler(pool: PgPool) {
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn graceful_shutdown_lets_short_jobs_finish_and_hands_long_ones_back(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let both_started = Arc::new(tokio::sync::Semaphore::new(0));
     let registry = {
         let quick_started = both_started.clone();
@@ -432,7 +433,7 @@ async fn graceful_shutdown_lets_short_jobs_finish_and_hands_long_ones_back(pool:
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn several_workers_share_a_queue_without_running_anything_twice(pool: PgPool) {
     const JOBS: usize = 150;
-    let store = JobStore::new(pool.clone());
+    let store = PgJobStore::new(pool.clone());
     let executed = Arc::new(Mutex::new(Vec::new()));
     let registry = {
         let executed = executed.clone();
@@ -492,7 +493,7 @@ async fn several_workers_share_a_queue_without_running_anything_twice(pool: PgPo
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn every_job_completes_exactly_once_while_workers_keep_crashing(pool: PgPool) {
     const JOBS: usize = 80;
-    let store = fast_retries(JobStore::new(pool.clone()));
+    let store = fast_retries(PgJobStore::new(pool.clone()));
     let (_stop_reaper, _reaper) = start_reaper(&store);
 
     let executions = Arc::new(AtomicUsize::new(0));
@@ -588,4 +589,99 @@ async fn every_job_completes_exactly_once_while_workers_keep_crashing(pool: PgPo
     assert_eq!(open, 0, "no attempt was left dangling");
     let executions = executions.load(Ordering::SeqCst);
     assert!(executions > JOBS, "{executions} executions for {JOBS} jobs");
+}
+
+#[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
+async fn a_handler_that_overruns_its_timeout_is_stopped_and_retried(pool: PgPool) {
+    let store = fast_retries(PgJobStore::new(pool));
+    let registry =
+        HandlerRegistry::new().register("job", |ctx: JobContext, _payload: Value| async move {
+            if ctx.attempt == 1 {
+                std::future::pending::<()>().await; // hangs forever
+            }
+            Ok(json!({ "attempt": ctx.attempt }))
+        });
+    let job = submit_with(&store, "job", json!({}), |s| s.timeout_secs = Some(1)).await;
+
+    let started = tokio::time::Instant::now();
+    let handle = start(Worker::new(store.clone(), registry, config("w1")));
+    let done = wait_for_state(&store, job.id, JobState::Succeeded).await;
+    handle.shutdown().await;
+
+    assert_eq!(done.result, Some(json!({ "attempt": 2 })));
+    let history = store.attempts(job.id).await.unwrap();
+    assert_eq!(history[0].outcome, Some(AttemptOutcome::Failed));
+    assert_eq!(history[0].error.as_deref(), Some("timed out after 1s"));
+    // Stopped at the timeout, not at the (60 s) lease.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
+async fn a_partitioned_worker_stops_before_its_lease_can_expire(pool: PgPool) {
+    // The guarantee that matters: by the time the database considers the lease
+    // expired (and a reaper may hand the job to someone else), the old worker
+    // has already stopped. Two copies must never run at the same time.
+    //
+    // Only durations are compared - local ones with local, database ones with
+    // database - because the host clock and the clock inside the Docker VM can
+    // be offset from each other.
+    let store = PgJobStore::new(pool.clone());
+    let partitioned_pool = PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_millis(100))
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let stopped_at = Arc::new(Mutex::new(None));
+    let registry = {
+        let stopped_at = stopped_at.clone();
+        HandlerRegistry::new().register("job", move |_ctx: JobContext, _payload: Value| {
+            let stopped_at = stopped_at.clone();
+            async move {
+                struct Mark(Arc<Mutex<Option<tokio::time::Instant>>>);
+                impl Drop for Mark {
+                    fn drop(&mut self) {
+                        *self.0.lock().unwrap() = Some(tokio::time::Instant::now());
+                    }
+                }
+                let _mark = Mark(stopped_at);
+                std::future::pending::<Result<Value, HandlerError>>().await
+            }
+        })
+    };
+    let job = submit(&store, "job", json!({})).await;
+
+    let worker = Worker::new(
+        PgJobStore::new(partitioned_pool.clone()),
+        registry,
+        short_lease("partitioned"),
+    );
+    // Taken before the worker exists, so no earlier than its claim.
+    let before_claim = tokio::time::Instant::now();
+    let handle = start(worker.clone());
+    wait_for_state(&store, job.id, JobState::Running).await;
+    partitioned_pool.close().await; // cut off: no more renewals
+
+    eventually(
+        "the handler to be stopped",
+        Duration::from_secs(5),
+        || async { stopped_at.lock().unwrap().is_some() },
+    )
+    .await;
+    let ran_for = stopped_at.lock().unwrap().unwrap() - before_claim;
+    // How long the database granted, from the claim to the (possibly renewed)
+    // expiry. A reaper could take the job back only after this.
+    let held = fetch(&store, job.id).await;
+    let granted = (held.lease_expires_at.unwrap() - held.started_at.unwrap())
+        .to_std()
+        .unwrap();
+    assert!(
+        ran_for < granted,
+        "handler ran {ran_for:?}, but the lease was only granted for {granted:?}"
+    );
+    handle.crash().await;
 }

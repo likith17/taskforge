@@ -16,6 +16,8 @@ pub struct JobContext {
     /// 1 for the first delivery. A handler can see `attempt > 1` and must be
     /// prepared for it: delivery is at-least-once.
     pub attempt: i32,
+    /// The worker running this attempt.
+    pub worker_id: String,
 }
 
 /// A handler's failure. The message is persisted with the job and returned by

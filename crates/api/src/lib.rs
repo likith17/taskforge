@@ -8,6 +8,7 @@
 //! | GET    | `/jobs/{id}/attempts`   | Delivery history of a job.                   |
 //! | POST   | `/jobs/{id}/cancel`     | Cancel a queued job / ask a running one to stop. |
 //! | POST   | `/jobs/{id}/retry`      | Re-drive a dead-lettered job.                |
+//! | GET    | `/metrics`              | Prometheus metrics (OpenMetrics text).        |
 //! | GET    | `/healthz`              | Liveness: the process is up.                 |
 //! | GET    | `/readyz`               | Readiness: the database is reachable.        |
 //!
@@ -28,6 +29,7 @@ use serde_json::json;
 use taskforge_domain::{
     IdempotencyKey, Job, JobId, JobState, JobSubmission, NewJob, ValidationError,
 };
+use taskforge_metrics::Metrics;
 use taskforge_storage::{CancelOutcome, JobStore, ListFilter, Submitted};
 
 pub use error::ApiError;
@@ -47,6 +49,9 @@ pub struct ApiConfig {
     /// worker refuses unregistered kinds regardless; this only gives the
     /// client the bad news at submit time instead of at run time.
     pub known_kinds: Option<BTreeSet<String>>,
+    /// The registry `/metrics` serves. In a process that also runs a worker
+    /// or reaper, pass theirs too so one endpoint shows everything.
+    pub metrics: Arc<Metrics>,
 }
 
 impl Default for ApiConfig {
@@ -55,29 +60,33 @@ impl Default for ApiConfig {
             // Room for a maximum-size payload plus the envelope around it.
             max_body_bytes: taskforge_domain::MAX_PAYLOAD_BYTES + 1024,
             known_kinds: None,
+            metrics: Metrics::shared(),
         }
     }
 }
 
 #[derive(Clone)]
-struct AppState {
-    store: JobStore,
+struct AppState<S> {
+    store: S,
     known_kinds: Option<Arc<BTreeSet<String>>>,
+    metrics: Arc<Metrics>,
 }
 
-pub fn router(store: JobStore, config: ApiConfig) -> Router {
+pub fn router<S: JobStore>(store: S, config: ApiConfig) -> Router {
     let state = AppState {
         store,
         known_kinds: config.known_kinds.map(Arc::new),
+        metrics: config.metrics,
     };
     Router::new()
-        .route("/jobs", post(submit_job).get(list_jobs))
-        .route("/jobs/{id}", get(get_job))
-        .route("/jobs/{id}/attempts", get(get_attempts))
-        .route("/jobs/{id}/cancel", post(cancel_job))
-        .route("/jobs/{id}/retry", post(retry_job))
+        .route("/jobs", post(submit_job::<S>).get(list_jobs::<S>))
+        .route("/jobs/{id}", get(get_job::<S>))
+        .route("/jobs/{id}/attempts", get(get_attempts::<S>))
+        .route("/jobs/{id}/cancel", post(cancel_job::<S>))
+        .route("/jobs/{id}/retry", post(retry_job::<S>))
+        .route("/metrics", get(metrics::<S>))
         .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
+        .route("/readyz", get(readyz::<S>))
         .fallback(|| async { ApiError::NotFound("no such route".to_owned()) })
         .layer(DefaultBodyLimit::max(config.max_body_bytes))
         .with_state(state)
@@ -101,8 +110,8 @@ fn parse_id(raw: &str) -> Result<JobId, ApiError> {
 
 // ------------------------------------------------------------------- submit
 
-async fn submit_job(
-    State(state): State<AppState>,
+async fn submit_job<S: JobStore>(
+    State(state): State<AppState<S>>,
     headers: HeaderMap,
     AppJson(submission): AppJson<JobSubmission>,
 ) -> Result<Response, ApiError> {
@@ -131,6 +140,7 @@ async fn submit_job(
     }
 
     let submitted = state.store.submit(&new_job).await?;
+    state.metrics.submitted(submitted.is_duplicate());
     let job = submitted.job();
     let location = (header::LOCATION, format!("/jobs/{}", job.id));
     Ok(match &submitted {
@@ -153,8 +163,8 @@ async fn submit_job(
 
 // -------------------------------------------------------------------- reads
 
-async fn get_job(
-    State(state): State<AppState>,
+async fn get_job<S: JobStore>(
+    State(state): State<AppState<S>>,
     Path(id): Path<String>,
 ) -> Result<Json<Job>, ApiError> {
     let id = parse_id(&id)?;
@@ -166,8 +176,8 @@ async fn get_job(
     Ok(Json(job))
 }
 
-async fn get_attempts(
-    State(state): State<AppState>,
+async fn get_attempts<S: JobStore>(
+    State(state): State<AppState<S>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let id = parse_id(&id)?;
@@ -189,8 +199,8 @@ struct ListParams {
     limit: Option<u32>,
 }
 
-async fn list_jobs(
-    State(state): State<AppState>,
+async fn list_jobs<S: JobStore>(
+    State(state): State<AppState<S>>,
     AppQuery(params): AppQuery<ListParams>,
 ) -> Result<impl IntoResponse, ApiError> {
     let job_state = params
@@ -233,8 +243,8 @@ async fn list_jobs(
 
 // ------------------------------------------------------------------ actions
 
-async fn cancel_job(
-    State(state): State<AppState>,
+async fn cancel_job<S: JobStore>(
+    State(state): State<AppState<S>>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id)?;
@@ -256,8 +266,8 @@ async fn cancel_job(
     })
 }
 
-async fn retry_job(
-    State(state): State<AppState>,
+async fn retry_job<S: JobStore>(
+    State(state): State<AppState<S>>,
     Path(id): Path<String>,
 ) -> Result<Json<Job>, ApiError> {
     let id = parse_id(&id)?;
@@ -268,11 +278,31 @@ async fn retry_job(
 
 // ------------------------------------------------------------------- health
 
+/// Process counters plus queue-wide gauges read from the store at scrape
+/// time. If the store cannot be read, the counters are still served (they are
+/// exactly what you want during an outage) with the gauges left as they were.
+async fn metrics<S: JobStore>(State(state): State<AppState<S>>) -> Response {
+    match state.store.stats().await {
+        Ok(stats) => state.metrics.observe_stats(&stats),
+        Err(err) => tracing::warn!(error = %err, "metrics: could not read queue statistics"),
+    }
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+        )],
+        state.metrics.encode(),
+    )
+        .into_response()
+}
+
 async fn healthz() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
-async fn readyz(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+async fn readyz<S: JobStore>(
+    State(state): State<AppState<S>>,
+) -> Result<impl IntoResponse, ApiError> {
     state.store.ping().await?;
     Ok(Json(json!({ "status": "ready" })))
 }

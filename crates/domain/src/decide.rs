@@ -79,8 +79,7 @@ mod tests {
 
     use super::*;
 
-    const POLICY: RetryPolicy =
-        RetryPolicy::new(Duration::from_secs(2), Duration::from_secs(60));
+    const POLICY: RetryPolicy = RetryPolicy::new(Duration::from_secs(2), Duration::from_secs(60));
 
     fn ctx(failures: i32, max_attempts: i32) -> FailureContext {
         FailureContext {
@@ -125,7 +124,10 @@ mod tests {
         let mut c = ctx(0, 10);
         c.cancel_requested = true;
         let d = decide_failure(c, true, &POLICY, 0.5);
-        assert_eq!((d.state, d.failures, d.retry_in), (JobState::Cancelled, 1, None));
+        assert_eq!(
+            (d.state, d.failures, d.retry_in),
+            (JobState::Cancelled, 1, None)
+        );
     }
 
     proptest! {

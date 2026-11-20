@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 taskforge-storage.workspace = true
+taskforge-metrics.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

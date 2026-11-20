@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use taskforge_domain::{Job, JobId, JobState, JobSubmission, NewJob, RetryPolicy};
-use taskforge_storage::JobStore;
+use taskforge_storage::{JobStore, PgJobStore};
 use taskforge_worker::{HandlerRegistry, Worker, WorkerConfig};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -22,24 +22,24 @@ pub fn config(worker_id: &str) -> WorkerConfig {
     }
 }
 
-pub fn worker_with(store: &JobStore, registry: HandlerRegistry) -> Worker {
+pub fn worker_with(store: &PgJobStore, registry: HandlerRegistry) -> Worker<PgJobStore> {
     Worker::new(store.clone(), registry, config("test-worker"))
 }
 
 /// Retries almost immediately, so tests do not wait out real backoff.
-pub fn fast_retries(store: JobStore) -> JobStore {
+pub fn fast_retries(store: PgJobStore) -> PgJobStore {
     store.with_retry_policy(RetryPolicy::new(
         Duration::from_millis(20),
         Duration::from_millis(40),
     ))
 }
 
-pub async fn submit(store: &JobStore, kind: &str, payload: Value) -> Job {
+pub async fn submit(store: &PgJobStore, kind: &str, payload: Value) -> Job {
     submit_with(store, kind, payload, |_| {}).await
 }
 
 pub async fn submit_with(
-    store: &JobStore,
+    store: &PgJobStore,
     kind: &str,
     payload: Value,
     edit: impl FnOnce(&mut JobSubmission),
@@ -56,7 +56,7 @@ pub async fn submit_with(
         .unwrap()
 }
 
-pub async fn fetch(store: &JobStore, id: JobId) -> Job {
+pub async fn fetch(store: &PgJobStore, id: JobId) -> Job {
     store.get(id).await.unwrap().unwrap()
 }
 
@@ -79,7 +79,7 @@ where
 }
 
 /// Wait for a job to reach `state` and return it.
-pub async fn wait_for_state(store: &JobStore, id: JobId, state: JobState) -> Job {
+pub async fn wait_for_state(store: &PgJobStore, id: JobId, state: JobState) -> Job {
     eventually(
         &format!("job {id} to be {state}"),
         Duration::from_secs(15),
@@ -95,7 +95,7 @@ pub struct Running {
     task: JoinHandle<()>,
 }
 
-pub fn start(worker: Worker) -> Running {
+pub fn start<S: JobStore>(worker: Worker<S>) -> Running {
     let (stop, stopped) = watch::channel(false);
     let task = tokio::spawn(async move { worker.run(stopped).await });
     Running { stop, task }

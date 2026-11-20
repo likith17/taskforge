@@ -39,18 +39,21 @@ pub trait JobStore: Clone + Send + Sync + 'static {
     /// Persist a new job as `queued`. With an idempotency key, at most one
     /// job is ever created per key; repeats get [`Submitted::Duplicate`], or
     /// [`StoreError::IdempotencyConflict`] if the request differs.
-    fn submit(&self, job: &NewJob)
-    -> impl Future<Output = Result<Submitted, StoreError>> + Send;
+    fn submit(&self, job: &NewJob) -> impl Future<Output = Result<Submitted, StoreError>> + Send;
 
     fn get(&self, id: JobId) -> impl Future<Output = Result<Option<Job>, StoreError>> + Send;
 
     /// Newest first, with keyset pagination on the (time-ordered) id.
-    fn list(&self, filter: &ListFilter)
-    -> impl Future<Output = Result<Vec<Job>, StoreError>> + Send;
+    fn list(
+        &self,
+        filter: &ListFilter,
+    ) -> impl Future<Output = Result<Vec<Job>, StoreError>> + Send;
 
     /// Delivery history of a job, oldest attempt first.
-    fn attempts(&self, id: JobId)
-    -> impl Future<Output = Result<Vec<JobAttempt>, StoreError>> + Send;
+    fn attempts(
+        &self,
+        id: JobId,
+    ) -> impl Future<Output = Result<Vec<JobAttempt>, StoreError>> + Send;
 
     /// Lease up to `limit` due jobs from `queues` to `worker_id`, highest
     /// priority first, then oldest `run_at`.

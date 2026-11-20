@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use taskforge_domain::{JobId, JobState};
+use taskforge_metrics::{JobOutcome, Metrics};
 use taskforge_storage::{Claim, ClaimedJob, JobStore, StoreError};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -12,6 +13,11 @@ use tokio::time::Instant;
 use tracing::Instrument;
 
 use crate::{HandlerRegistry, JobContext};
+
+/// The worker stops a handler once this fraction of the lease has passed
+/// without a successful renewal. See [`Inner::execute`] for why it is less
+/// than one.
+const SELF_FENCE_AT: f64 = 0.9;
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -51,6 +57,20 @@ pub enum Outcome {
     Unreported(JobId),
 }
 
+impl Outcome {
+    fn metric(self) -> JobOutcome {
+        match self {
+            Outcome::Succeeded(_) => JobOutcome::Succeeded,
+            Outcome::Retrying(_) => JobOutcome::Retrying,
+            Outcome::Dead(_) => JobOutcome::DeadLettered,
+            Outcome::Cancelled(_) => JobOutcome::Cancelled,
+            Outcome::Released(_) => JobOutcome::Released,
+            Outcome::LostClaim(_) => JobOutcome::LostClaim,
+            Outcome::Unreported(_) => JobOutcome::Unreported,
+        }
+    }
+}
+
 /// Why a running handler is being stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stop {
@@ -69,9 +89,9 @@ enum Verdict {
 struct Active {
     claim: Claim,
     stop: watch::Sender<Option<Stop>>,
-    /// Local time until which we *know* the lease is valid: when the claim or
-    /// the last successful renewal was sent, plus the lease length.
-    lease_valid_until: Instant,
+    /// Local time until which the lease is *known* to be valid, minus a
+    /// safety margin. Moved forward by every successful renewal.
+    valid_until: watch::Sender<Instant>,
 }
 
 impl Active {
@@ -88,28 +108,64 @@ impl Active {
     }
 }
 
-struct Inner {
-    store: JobStore,
+struct Inner<S> {
+    store: S,
+    /// Heartbeats get their own store (normally a separate, small pool), so
+    /// that claims and settles saturating the main pool cannot delay lease
+    /// renewal. A starved heartbeat means healthy jobs lose their leases and
+    /// run twice.
+    heartbeat_store: S,
     registry: HandlerRegistry,
     config: WorkerConfig,
+    metrics: Arc<Metrics>,
     active: Mutex<HashMap<JobId, Active>>,
 }
 
-#[derive(Clone)]
-pub struct Worker {
-    inner: Arc<Inner>,
+pub struct Worker<S> {
+    inner: Arc<Inner<S>>,
 }
 
-impl Worker {
-    pub fn new(store: JobStore, registry: HandlerRegistry, config: WorkerConfig) -> Self {
+impl<S> Clone for Worker<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<S: JobStore> Worker<S> {
+    pub fn new(store: S, registry: HandlerRegistry, config: WorkerConfig) -> Self {
         Self {
             inner: Arc::new(Inner {
+                heartbeat_store: store.clone(),
                 store,
                 registry,
                 config,
+                metrics: Metrics::shared(),
                 active: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    fn configure(&mut self) -> &mut Inner<S> {
+        Arc::get_mut(&mut self.inner).expect("configure a worker before cloning or running it")
+    }
+
+    /// Send lease renewals through `store` instead of the main one.
+    pub fn with_heartbeat_store(mut self, store: S) -> Self {
+        self.configure().heartbeat_store = store;
+        self
+    }
+
+    /// Record into a shared metrics registry (normally the one `/metrics`
+    /// serves).
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.configure().metrics = metrics;
+        self
+    }
+
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.inner.metrics
     }
 
     pub fn id(&self) -> &str {
@@ -168,6 +224,7 @@ impl Worker {
                     permits.len() as u32,
                 )
                 .await;
+            inner.metrics.claim_took(sent_at.elapsed().as_secs_f64());
             let pause = match claimed {
                 Ok(claimed) if !claimed.is_empty() => {
                     consecutive_errors = 0;
@@ -255,12 +312,17 @@ impl Worker {
     }
 }
 
-impl Inner {
+impl<S: JobStore> Inner<S> {
     fn active(&self) -> MutexGuard<'_, HashMap<JobId, Active>> {
         // A panic while holding the lock cannot leave the map inconsistent
         // (every critical section is a single insert/remove/read), so a
         // poisoned lock is safe to keep using.
         self.active.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// How long after sending a claim or renewal we may keep working.
+    fn fence_window(&self) -> Duration {
+        self.config.lease.mul_f64(SELF_FENCE_AT)
     }
 
     async fn run_job(
@@ -274,43 +336,70 @@ impl Inner {
             tracing::info_span!("job", job_id = %job.id, kind = %job.kind, attempt = job.attempt);
         async move {
             tracing::info!("job claimed");
+            if let Some(started) = job.started_at {
+                // Both instants come from the database clock.
+                let waited = (started - job.run_at).num_milliseconds() as f64 / 1000.0;
+                self.metrics.queue_waited(waited);
+            }
+
             let (stop_tx, stop_rx) = watch::channel(None);
+            let (valid_tx, valid_rx) = watch::channel(claim_sent_at + self.fence_window());
             self.active().insert(
                 job.id,
                 Active {
                     claim: claim.clone(),
                     stop: stop_tx,
-                    lease_valid_until: claim_sent_at + self.config.lease,
+                    valid_until: valid_tx,
                 },
             );
             // Removes the entry however this task ends, including by abort.
             let _registered = Registered {
-                inner: &self,
+                active: &self.active,
                 job_id: job.id,
             };
 
+            let timeout = Duration::from_secs(u64::try_from(job.timeout_secs.max(1)).unwrap_or(1));
             let ctx = JobContext {
                 job_id: job.id,
                 kind: job.kind,
                 queue: job.queue,
                 attempt: job.attempt,
+                worker_id: claim.worker_id().to_owned(),
             };
-            let verdict = self.execute(ctx, job.payload, stop_rx).await;
+            let started = Instant::now();
+            let verdict = self
+                .execute(ctx, job.payload, timeout, stop_rx, valid_rx)
+                .await;
+            self.metrics.executed_for(started.elapsed().as_secs_f64());
             // From here on stop signals are ignored: the handler is finished
             // and only the outcome remains to be written. Heartbeats keep the
-            // lease alive while we do that.
-            self.settle(&claim, verdict).await
+            // lease alive meanwhile, and the write is fenced regardless.
+            let outcome = self.settle(&claim, verdict).await;
+            self.metrics.job_outcome(outcome.metric());
+            outcome
         }
         .instrument(span)
         .await
     }
 
-    /// Run the handler until it finishes or we are told to stop it.
+    /// Run the handler until it finishes, times out, or must be stopped.
+    ///
+    /// Self-fencing: the worker stops the handler when `valid_until` passes
+    /// without a renewal. That instant is measured from when the claim or
+    /// renewal was *sent*, which is no later than when the database wrote the
+    /// lease, so the local deadline falls before the database's - and only
+    /// after the database's deadline can the reaper hand the job to another
+    /// worker. Stopping at 90% of the lease leaves room for clock-rate drift
+    /// and for the abort to take effect. A dedicated timer per job (rather
+    /// than a check on each heartbeat tick) means the worker reacts at the
+    /// deadline itself, not up to a third of a lease later.
     async fn execute(
         &self,
         ctx: JobContext,
         payload: Value,
+        timeout: Duration,
         mut stop: watch::Receiver<Option<Stop>>,
+        mut valid_until: watch::Receiver<Instant>,
     ) -> Verdict {
         let Some(handler) = self.registry.get(&ctx.kind) else {
             return Verdict::Failed {
@@ -321,29 +410,50 @@ impl Inner {
         // A separate task, so a panicking handler takes down neither this
         // worker nor the process. Aborted if we are dropped.
         let mut task = AbortOnDrop(tokio::spawn(handler.run(ctx, payload)));
-        tokio::select! {
-            joined = &mut task.0 => match joined {
-                Ok(Ok(result)) => Verdict::Done(result),
-                Ok(Err(error)) => Verdict::Failed {
-                    error: error.message().to_owned(),
-                    retryable: error.is_retryable(),
+        let timeout_at = Instant::now() + timeout;
+        let mut renewals_open = true;
+
+        loop {
+            let deadline = *valid_until.borrow_and_update();
+            let stopped = tokio::select! {
+                // A finished handler wins every tie: its result is still
+                // worth offering, and the settle is fenced anyway.
+                biased;
+                joined = &mut task.0 => return match joined {
+                    Ok(Ok(result)) => Verdict::Done(result),
+                    Ok(Err(error)) => Verdict::Failed {
+                        error: error.message().to_owned(),
+                        retryable: error.is_retryable(),
+                    },
+                    Err(join_error) if join_error.is_panic() => Verdict::Failed {
+                        error: "handler panicked".to_owned(),
+                        retryable: true,
+                    },
+                    Err(_) => Verdict::Failed {
+                        error: "handler task was cancelled".to_owned(),
+                        retryable: true,
+                    },
                 },
-                Err(join_error) if join_error.is_panic() => Verdict::Failed {
-                    error: "handler panicked".to_owned(),
+                reason = stop_signal(&mut stop) => Verdict::Stopped(reason),
+                () = tokio::time::sleep_until(deadline) => {
+                    tracing::warn!("lease could not be renewed in time; stopping the handler");
+                    Verdict::Stopped(Stop::LeaseLost)
+                }
+                () = tokio::time::sleep_until(timeout_at) => Verdict::Failed {
+                    error: format!("timed out after {}s", timeout.as_secs()),
                     retryable: true,
                 },
-                Err(_) => Verdict::Failed {
-                    error: "handler task was cancelled".to_owned(),
-                    retryable: true,
-                },
-            },
-            reason = stop_signal(&mut stop) => {
-                // Abort takes effect at the handler's next await point. Wait
-                // for it, so the handler is really gone before we report.
-                task.0.abort();
-                let _ = (&mut task.0).await;
-                Verdict::Stopped(reason)
-            }
+                changed = valid_until.changed(), if renewals_open => {
+                    // A renewal moved the deadline; wait on the new one.
+                    renewals_open = changed.is_ok();
+                    continue;
+                }
+            };
+            // Abort takes effect at the handler's next await point. Wait for
+            // it, so the handler is really gone before anything is reported.
+            task.0.abort();
+            let _ = (&mut task.0).await;
+            return stopped;
         }
     }
 
@@ -381,7 +491,7 @@ impl Inner {
                     tracing::info!("job succeeded");
                     Outcome::Succeeded(id)
                 }
-                (_, JobState::Queued) if matches!(verdict, Verdict::Stopped(_)) => {
+                (Verdict::Stopped(_), JobState::Queued) => {
                     tracing::info!("job released back to the queue");
                     Outcome::Released(id)
                 }
@@ -419,7 +529,7 @@ impl Inner {
 }
 
 /// Renew every held lease each `lease / 3`, and act on what comes back.
-async fn heartbeat_loop(inner: Arc<Inner>) {
+async fn heartbeat_loop<S: JobStore>(inner: Arc<Inner<S>>) {
     let lease = inner.config.lease;
     let mut ticker = tokio::time::interval((lease / 3).max(Duration::from_millis(10)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -428,43 +538,39 @@ async fn heartbeat_loop(inner: Arc<Inner>) {
     loop {
         ticker.tick().await;
         let claims: Vec<Claim> = inner.active().values().map(|a| a.claim.clone()).collect();
-
-        if !claims.is_empty() {
-            let sent_at = Instant::now();
-            match inner
-                .store
-                .heartbeat(&inner.config.worker_id, &claims, lease)
-                .await
-            {
-                Ok(beat) => {
-                    let mut active = inner.active();
-                    for claim in &claims {
-                        let id = claim.job_id();
-                        // The job may have finished while the heartbeat was in flight.
-                        let Some(entry) = active.get_mut(&id).filter(|e| e.claim == *claim) else {
-                            continue;
-                        };
-                        if beat.lost.contains(&id) {
-                            entry.stop(Stop::LeaseLost);
-                        } else {
-                            entry.lease_valid_until = sent_at + lease;
-                            if beat.cancel_requested.contains(&id) {
-                                entry.stop(Stop::Cancelled);
-                            }
+        if claims.is_empty() {
+            continue;
+        }
+        let sent_at = Instant::now();
+        match inner
+            .heartbeat_store
+            .heartbeat(&inner.config.worker_id, &claims, lease)
+            .await
+        {
+            Ok(beat) => {
+                let active = inner.active();
+                for claim in &claims {
+                    let id = claim.job_id();
+                    // The job may have finished while the heartbeat was in flight.
+                    let Some(entry) = active.get(&id).filter(|e| e.claim == *claim) else {
+                        continue;
+                    };
+                    if beat.lost.contains(&id) {
+                        entry.stop(Stop::LeaseLost);
+                    } else {
+                        entry
+                            .valid_until
+                            .send_replace(sent_at + inner.fence_window());
+                        if beat.cancel_requested.contains(&id) {
+                            entry.stop(Stop::Cancelled);
                         }
                     }
                 }
-                Err(err) => tracing::warn!(error = %err, "heartbeat failed"),
             }
-        }
-
-        // Self-fencing. If we have not managed to renew a lease in time, the
-        // scheduler is entitled to give the job to someone else. Stop working
-        // on it rather than run alongside its replacement.
-        let now = Instant::now();
-        for entry in inner.active().values() {
-            if now >= entry.lease_valid_until {
-                entry.stop(Stop::LeaseLost);
+            // No renewal: each job's own timer stops it if this goes on.
+            Err(err) => {
+                inner.metrics.heartbeat_failed();
+                tracing::warn!(error = %err, "heartbeat failed");
             }
         }
     }
@@ -533,13 +639,16 @@ impl<T> Drop for AbortOnDrop<T> {
 
 /// Removes a job from the active set when dropped.
 struct Registered<'a> {
-    inner: &'a Inner,
+    active: &'a Mutex<HashMap<JobId, Active>>,
     job_id: JobId,
 }
 
 impl Drop for Registered<'_> {
     fn drop(&mut self) {
-        self.inner.active().remove(&self.job_id);
+        self.active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.job_id);
     }
 }
 

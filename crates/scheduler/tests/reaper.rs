@@ -3,14 +3,14 @@ use std::time::Duration;
 use sqlx::PgPool;
 use taskforge_domain::{JobState, JobSubmission, NewJob};
 use taskforge_scheduler::{Reaper, ReaperConfig};
-use taskforge_storage::JobStore;
+use taskforge_storage::{JobStore, PgJobStore};
 use tokio::sync::watch;
 
 fn queues() -> Vec<String> {
     vec!["default".to_owned()]
 }
 
-async fn enqueue(store: &JobStore, n: usize) {
+async fn enqueue(store: &PgJobStore, n: usize) {
     for _ in 0..n {
         let job = NewJob::try_from(JobSubmission {
             kind: "echo".to_owned(),
@@ -31,7 +31,7 @@ async fn count(pool: &PgPool, state: JobState) -> i64 {
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn tick_recovers_every_expired_lease_across_batches(pool: PgPool) {
-    let store = JobStore::new(pool.clone());
+    let store = PgJobStore::new(pool.clone());
     enqueue(&store, 25).await;
     // Twenty abandoned by a worker with a lease that is already over; five
     // held by a healthy one.
@@ -60,6 +60,7 @@ async fn tick_recovers_every_expired_lease_across_batches(pool: PgPool) {
         ReaperConfig {
             interval: Duration::from_secs(1),
             batch: 7,
+            ..ReaperConfig::default()
         },
     );
     let reaped = reaper.tick().await.unwrap();
@@ -76,7 +77,7 @@ async fn tick_recovers_every_expired_lease_across_batches(pool: PgPool) {
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn run_loop_recovers_leases_as_they_expire_and_stops_on_shutdown(pool: PgPool) {
-    let store = JobStore::new(pool.clone());
+    let store = PgJobStore::new(pool.clone());
     enqueue(&store, 3).await;
     store
         .claim("dead", &queues(), Duration::from_millis(150), 3)
@@ -88,6 +89,7 @@ async fn run_loop_recovers_leases_as_they_expire_and_stops_on_shutdown(pool: PgP
         ReaperConfig {
             interval: Duration::from_millis(25),
             batch: 100,
+            ..ReaperConfig::default()
         },
     );
     let (stop, stopped) = watch::channel(false);
@@ -115,10 +117,11 @@ async fn run_loop_recovers_leases_as_they_expire_and_stops_on_shutdown(pool: PgP
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn run_loop_survives_a_database_outage(pool: PgPool) {
     let reaper = Reaper::new(
-        JobStore::new(pool.clone()),
+        PgJobStore::new(pool.clone()),
         ReaperConfig {
             interval: Duration::from_millis(20),
             batch: 100,
+            ..ReaperConfig::default()
         },
     );
     pool.close().await;

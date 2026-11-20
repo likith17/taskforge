@@ -9,13 +9,13 @@ use common::{fetch, submit, worker_with};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use taskforge_domain::JobState;
-use taskforge_storage::JobStore;
+use taskforge_storage::{JobStore, PgJobStore};
 use taskforge_worker::{HandlerError, HandlerRegistry, JobContext, Outcome, handlers};
 use tokio::sync::watch;
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn runs_a_job_and_persists_its_result(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let worker = worker_with(&store, handlers::builtin());
     let job = submit(&store, "sum", json!({"numbers": [40, 2]})).await;
 
@@ -38,7 +38,7 @@ async fn runs_a_job_and_persists_its_result(pool: PgPool) {
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn handler_receives_the_job_context(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let registry =
         HandlerRegistry::new().register("inspect", |ctx: JobContext, payload: Value| async move {
             Ok(json!({
@@ -68,7 +68,7 @@ async fn retryable_failure_requeues_and_fatal_failure_dead_letters(pool: PgPool)
         Err(HandlerError::fatal("this input can never work"))
     }
 
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let worker = worker_with(&store, handlers::builtin().register("fatal", fatal));
 
     // The built-in `fail` kind fails retryably.
@@ -99,7 +99,7 @@ async fn retryable_failure_requeues_and_fatal_failure_dead_letters(pool: PgPool)
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn unregistered_kind_is_never_executed(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let worker = worker_with(&store, handlers::builtin());
     // Reaches the queue only because this test bypasses the API's kind check.
     let job = submit(&store, "shell", json!({"cmd": "rm -rf /"})).await;
@@ -123,7 +123,7 @@ async fn panicking_handler_fails_the_job_but_not_the_worker(pool: PgPool) {
         panic!("handler bug");
     }
 
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let registry = handlers::builtin().register("explode", explode);
     let worker = worker_with(&store, registry);
     let bad = submit(&store, "explode", json!({})).await;
@@ -154,7 +154,7 @@ async fn panicking_handler_fails_the_job_but_not_the_worker(pool: PgPool) {
 async fn losing_the_claim_mid_run_discards_the_outcome(pool: PgPool) {
     // While the handler runs, the lease expires and the reaper takes the job
     // back. The handler's result must not be recorded.
-    let store = JobStore::new(pool.clone());
+    let store = PgJobStore::new(pool.clone());
     let reaper_store = store.clone();
     let registry =
         HandlerRegistry::new().register("slow", move |ctx: JobContext, _payload: Value| {
@@ -191,7 +191,7 @@ async fn losing_the_claim_mid_run_discards_the_outcome(pool: PgPool) {
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn run_loop_drains_the_queue_and_stops_on_shutdown(pool: PgPool) {
-    let store = JobStore::new(pool);
+    let store = PgJobStore::new(pool);
     let worker = worker_with(&store, handlers::builtin());
     let (stop, stopped) = watch::channel(false);
     let running = tokio::spawn(async move { worker.run(stopped).await });
@@ -225,7 +225,7 @@ async fn run_loop_drains_the_queue_and_stops_on_shutdown(pool: PgPool) {
 
 #[sqlx::test(migrator = "taskforge_storage::MIGRATOR")]
 async fn worker_survives_a_database_outage(pool: PgPool) {
-    let store = JobStore::new(pool.clone());
+    let store = PgJobStore::new(pool.clone());
     let worker = worker_with(&store, handlers::builtin());
 
     pool.close().await;

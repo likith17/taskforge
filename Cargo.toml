@@ -15,6 +15,7 @@ taskforge-storage = { path = "crates/storage" }
 taskforge-api = { path = "crates/api" }
 taskforge-worker = { path = "crates/worker" }
 taskforge-scheduler = { path = "crates/scheduler" }
+taskforge-metrics = { path = "crates/metrics" }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "net"] }
 axum = { version = "0.8", features = ["macros"] }
@@ -36,6 +37,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
 sha2 = "0.10" # already in the dependency tree via sqlx-postgres
+prometheus-client = "0.22"
 
 # test-only
 proptest = { version = "1", default-features = false, features = ["std"] }
