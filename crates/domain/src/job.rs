@@ -21,6 +21,8 @@ pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 /// storage layer passes to PostgreSQL.
 pub const MAX_MAX_ATTEMPTS: u32 = 25;
 pub const MAX_IDEMPOTENCY_KEY_LEN: usize = 255;
+pub const DEFAULT_TIMEOUT_SECS: u32 = 300;
+pub const MAX_TIMEOUT_SECS: u32 = 24 * 60 * 60;
 /// Furthest into the future a job may be delayed.
 pub const MAX_DELAY: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
@@ -81,7 +83,13 @@ pub struct Job {
     /// dead-lettered when this reaches `max_attempts`.
     pub failures: i32,
     pub max_attempts: i32,
+    /// A handler running longer than this is stopped and the attempt failed.
+    pub timeout_secs: i32,
     pub idempotency_key: Option<String>,
+    /// Fingerprint of the submission that created the job (see
+    /// [`NewJob::request_hash`]). Not part of the API response.
+    #[serde(skip)]
+    pub request_hash: Option<String>,
     /// Someone asked for this job to be cancelled. For a running job this is a
     /// request the worker has not acted on yet.
     pub cancel_requested: bool,
@@ -127,6 +135,9 @@ pub struct JobSubmission {
     /// How many failed attempts are allowed before the job is dead-lettered.
     #[serde(default)]
     pub max_attempts: Option<u32>,
+    /// Longest a single attempt may run, in seconds.
+    #[serde(default)]
+    pub timeout_secs: Option<u32>,
 }
 
 /// A client-chosen key that makes a submission safe to repeat: every request
@@ -183,7 +194,9 @@ pub struct NewJob {
     priority: i16,
     schedule: Schedule,
     max_attempts: i32,
+    timeout_secs: i32,
     idempotency_key: Option<IdempotencyKey>,
+    request_hash: String,
 }
 
 impl NewJob {
@@ -201,19 +214,42 @@ impl NewJob {
         self.max_attempts
     }
 
+    pub fn timeout_secs(&self) -> i32 {
+        self.timeout_secs
+    }
+
+    /// SHA-256 of the canonical form of this submission, hex-encoded.
+    ///
+    /// Stored with the job so that a repeated idempotency key can be checked
+    /// against the *original request*, not against the stored row. The row is
+    /// not a faithful copy: PostgreSQL's `jsonb` normalises numbers (`1e2`
+    /// comes back as `100`), and `serde_json` considers the float `100.0` and
+    /// the integer `100` different values. Comparing rows rejected genuine
+    /// retries; comparing fingerprints of what the client sent does not.
+    ///
+    /// The schedule is deliberately left out: a relative `delay_ms` resolves
+    /// to a different instant on every retry of the same request.
+    pub fn request_hash(&self) -> &str {
+        &self.request_hash
+    }
+
     /// Whether `existing` is what this submission would have created. Used
     /// when an idempotency key is seen again: the same key with a different
     /// request is a client bug and must not be answered with someone else's
     /// job.
-    ///
-    /// The schedule is deliberately not compared: a relative `delay_ms`
-    /// resolves to a different instant on every retry of the same request.
     pub fn same_request_as(&self, existing: &Job) -> bool {
-        self.kind == existing.kind
-            && self.queue == existing.queue
-            && self.payload == existing.payload
-            && self.priority == existing.priority
-            && self.max_attempts == existing.max_attempts
+        match &existing.request_hash {
+            Some(hash) => *hash == self.request_hash,
+            // Rows written before fingerprints existed: compare the fields.
+            None => {
+                self.kind == existing.kind
+                    && self.queue == existing.queue
+                    && self.payload == existing.payload
+                    && self.priority == existing.priority
+                    && self.max_attempts == existing.max_attempts
+                    && self.timeout_secs == existing.timeout_secs
+            }
+        }
     }
 
     pub fn id(&self) -> JobId {
@@ -304,6 +340,26 @@ impl TryFrom<JobSubmission> for NewJob {
             ));
         }
 
+        let timeout_secs = s.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
+        if !(1..=MAX_TIMEOUT_SECS).contains(&timeout_secs) {
+            return Err(ValidationError::new(
+                "timeout_secs",
+                format!("must be between 1 and {MAX_TIMEOUT_SECS}"),
+            ));
+        }
+
+        // Both range-checked above, so the casts cannot wrap.
+        let max_attempts = max_attempts as i32;
+        let timeout_secs = timeout_secs as i32;
+        let request_hash = fingerprint(&serde_json::json!({
+            "kind": s.kind,
+            "queue": queue,
+            "payload": payload,
+            "priority": priority,
+            "max_attempts": max_attempts,
+            "timeout_secs": timeout_secs,
+        }));
+
         Ok(NewJob {
             id: JobId::new(),
             queue,
@@ -311,9 +367,60 @@ impl TryFrom<JobSubmission> for NewJob {
             payload,
             priority,
             schedule,
-            max_attempts: max_attempts as i32, // range-checked above
+            max_attempts,
+            timeout_secs,
             idempotency_key: None,
+            request_hash,
         })
+    }
+}
+
+/// Hex SHA-256 of `value` written in canonical form.
+fn fingerprint(value: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    let mut canonical = String::new();
+    write_canonical(value, &mut canonical);
+    let digest = Sha256::digest(canonical.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// JSON with object keys sorted at every level, so that two documents that
+/// differ only in key order produce the same text. Written by hand because
+/// `serde_json` keeps insertion order when any crate in the build enables its
+/// `preserve_order` feature.
+fn write_canonical(value: &Value, out: &mut String) {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, key) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(key.clone()).to_string());
+                out.push(':');
+                write_canonical(&map[key], out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(']');
+        }
+        scalar => out.push_str(&scalar.to_string()),
     }
 }
 
@@ -472,6 +579,93 @@ mod tests {
             let err = IdempotencyKey::parse(bad).unwrap_err();
             assert_eq!(err.field, "Idempotency-Key", "{bad:?}");
         }
+    }
+
+    #[test]
+    fn timeout_defaults_and_is_bounded() {
+        let job = NewJob::try_from(submission("echo")).unwrap();
+        assert_eq!(job.timeout_secs(), DEFAULT_TIMEOUT_SECS as i32);
+        for (value, ok) in [(0, false), (1, true), (86_400, true), (86_401, false)] {
+            let mut s = submission("echo");
+            s.timeout_secs = Some(value);
+            let result = NewJob::try_from(s);
+            assert_eq!(result.is_ok(), ok, "timeout_secs {value}");
+            if let Err(err) = result {
+                assert_eq!(err.field, "timeout_secs");
+            }
+        }
+    }
+
+    fn from_json(text: &str) -> NewJob {
+        NewJob::try_from(serde_json::from_str::<JobSubmission>(text).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn request_hash_identifies_the_request_not_its_spelling() {
+        let a = from_json(r#"{"kind":"echo","payload":{"a":1,"b":{"x":[1,2],"y":null}}}"#);
+        // Same request, keys in another order, defaults spelled out.
+        let b = from_json(
+            r#"{"payload":{"b":{"y":null,"x":[1,2]},"a":1},"queue":"default","kind":"echo","priority":0}"#,
+        );
+        assert_eq!(a.request_hash(), b.request_hash());
+        assert_eq!(a.request_hash().len(), 64);
+        assert_ne!(a.id(), b.id(), "still two distinct submissions");
+
+        // The schedule is not part of the request's identity.
+        let delayed = from_json(r#"{"kind":"echo","payload":{"a":1,"b":{"x":[1,2],"y":null}},"delay_ms":500}"#);
+        assert_eq!(a.request_hash(), delayed.request_hash());
+
+        // Anything that changes what would run does change the hash.
+        for different in [
+            r#"{"kind":"echo","payload":{"a":2,"b":{"x":[1,2],"y":null}}}"#,
+            r#"{"kind":"echo","payload":{"a":1,"b":{"x":[2,1],"y":null}}}"#,
+            r#"{"kind":"sum","payload":{"a":1,"b":{"x":[1,2],"y":null}}}"#,
+            r#"{"kind":"echo","queue":"bulk","payload":{"a":1,"b":{"x":[1,2],"y":null}}}"#,
+            r#"{"kind":"echo","priority":1,"payload":{"a":1,"b":{"x":[1,2],"y":null}}}"#,
+            r#"{"kind":"echo","max_attempts":2,"payload":{"a":1,"b":{"x":[1,2],"y":null}}}"#,
+            r#"{"kind":"echo","timeout_secs":9,"payload":{"a":1,"b":{"x":[1,2],"y":null}}}"#,
+        ] {
+            assert_ne!(a.request_hash(), from_json(different).request_hash(), "{different}");
+        }
+    }
+
+    #[test]
+    fn a_retry_matches_its_stored_job_even_after_number_normalisation() {
+        // The client sends 1e2. PostgreSQL jsonb hands it back as 100, and
+        // serde_json says Number(100.0) != Number(100): comparing payloads
+        // would call this genuine retry a conflict.
+        let original = from_json(r#"{"kind":"echo","payload":{"n":1e2}}"#);
+        let stored_payload: Value = serde_json::from_str(r#"{"n":100}"#).unwrap();
+        assert_ne!(original.payload(), &stored_payload, "the trap is real");
+
+        let stored = Job {
+            id: original.id(),
+            queue: original.queue().to_owned(),
+            kind: original.kind().to_owned(),
+            payload: stored_payload,
+            state: JobState::Queued,
+            priority: 0,
+            run_at: Utc::now(),
+            attempt: 0,
+            failures: 0,
+            max_attempts: original.max_attempts(),
+            timeout_secs: original.timeout_secs(),
+            idempotency_key: Some("k".to_owned()),
+            request_hash: Some(original.request_hash().to_owned()),
+            cancel_requested: false,
+            lease_owner: None,
+            lease_expires_at: None,
+            result: None,
+            last_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+        };
+        let retry = from_json(r#"{"kind":"echo","payload":{"n":1e2}}"#);
+        assert!(retry.same_request_as(&stored));
+        let other = from_json(r#"{"kind":"echo","payload":{"n":101}}"#);
+        assert!(!other.same_request_as(&stored));
     }
 
     #[test]

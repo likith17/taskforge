@@ -35,6 +35,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
+sha2 = "0.10" # already in the dependency tree via sqlx-postgres
 
 # test-only
 proptest = { version = "1", default-features = false, features = ["std"] }
