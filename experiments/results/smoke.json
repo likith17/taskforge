@@ -1,0 +1,66 @@
+{
+  "checks": {
+    "every deliberately failing job was dead-lettered": true,
+    "every healthy job succeeded": true,
+    "every job reached a terminal state": true,
+    "every orphaned job was recovered": true,
+    "every result is the right one": true,
+    "exactly one committed result per succeeded job": true,
+    "no attempt left open": true,
+    "no duplicate jobs from duplicate submissions": true,
+    "no stuck leases": true
+  },
+  "config": {
+    "concurrency_per_worker": 2,
+    "deliberately_failing_jobs": 3,
+    "jobs": 60,
+    "kill_every_ms": 1500,
+    "lease_ms": 2000,
+    "reap_interval_ms": 250,
+    "retry_base_ms": 250,
+    "retry_cap_ms": 2000,
+    "scheduler_down_ms": 1000,
+    "scheduler_kill_every_ms": 0,
+    "seed": 1,
+    "work_ms": "20..420",
+    "worker_reaper": false,
+    "workers": 3
+  },
+  "elapsed_secs": 4.142,
+  "experiment": "chaos",
+  "kills": {
+    "orphaned_attempts": 2,
+    "scheduler": 0,
+    "workers": 2
+  },
+  "name": "smoke",
+  "passed": true,
+  "results": {
+    "attempt_outcomes": {
+      "failed": 9,
+      "lease_expired": 2,
+      "succeeded": 57
+    },
+    "completion_rate_healthy_jobs": 1.0,
+    "dead_lettered": 3,
+    "duplicate_committed_results": 0,
+    "duplicate_submissions_answered": 60,
+    "handler_executions": 68,
+    "healthy_jobs_executed_more_than_once": 2,
+    "jobs_in_database": 60,
+    "jobs_whose_unprotected_side_effect_ran_twice": 0,
+    "open_attempts": 0,
+    "orphans_dead_lettered_by_reaper": 0,
+    "recovery_secs": {
+      "max": 2.144,
+      "mean": 2.113,
+      "n": 2,
+      "p50": 2.083,
+      "p95": 2.144,
+      "p99": 2.144
+    },
+    "stuck_leases": 0,
+    "succeeded": 57,
+    "unrecovered_orphans": 0
+  }
+}

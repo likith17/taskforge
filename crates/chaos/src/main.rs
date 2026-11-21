@@ -249,20 +249,20 @@ async fn submit_jobs(
 ) -> anyhow::Result<usize> {
     // Each job is submitted with an idempotency key; with `twice`, every
     // submission is sent a second time concurrently, like a client retrying.
-    let make = Arc::new(make);
     let mut duplicates = 0;
     for chunk in (0..count).collect::<Vec<_>>().chunks(64) {
         let mut tasks = Vec::new();
         for &i in chunk {
+            // Built once per job, so a repeat is byte-for-byte the same request.
+            let (spec, max_attempts) = make(i);
             for _ in 0..if twice { 2 } else { 1 } {
                 let store = store.clone();
-                let make = make.clone();
+                let spec = spec.clone();
                 tasks.push(tokio::spawn(async move {
-                    let (payload, max_attempts) = make(i);
-                    let kind = payload["kind"].as_str().unwrap_or("chaos").to_owned();
+                    let kind = spec["kind"].as_str().unwrap_or("chaos").to_owned();
                     let new = NewJob::try_from(JobSubmission {
                         kind,
-                        payload: Some(payload["payload"].clone()),
+                        payload: Some(spec["payload"].clone()),
                         max_attempts: Some(max_attempts),
                         ..Default::default()
                     })?
@@ -501,8 +501,12 @@ async fn chaos(o: &Options) -> anyhow::Result<()> {
             .fetch_all(&pool)
             .await?;
 
-    // Recovery: from the kill to the start of the orphaned job's next attempt.
+    // Recovery: from the kill to the start of the orphaned job's next
+    // attempt. An orphan whose attempt was its last (a deliberately failing
+    // job on attempt 3) is not re-run: the reaper takes it back and
+    // dead-letters it, which also counts as recovered.
     let mut recovery = Vec::new();
+    let mut settled_by_reaper = 0;
     let mut unrecovered = 0;
     for (id, attempt, killed_at) in &orphans {
         let next: Option<DateTime<Utc>> = sqlx::query_scalar(
@@ -512,11 +516,23 @@ async fn chaos(o: &Options) -> anyhow::Result<()> {
         .bind(attempt + 1)
         .fetch_optional(&pool)
         .await?;
-        match next {
-            Some(at) => {
-                recovery.push((at - *killed_at).num_microseconds().unwrap_or(0) as f64 / 1e6)
-            }
-            None => unrecovered += 1,
+        if let Some(at) = next {
+            recovery.push((at - *killed_at).num_microseconds().unwrap_or(0) as f64 / 1e6);
+            continue;
+        }
+        let reaped_and_final: bool = sqlx::query_scalar(
+            "SELECT a.outcome = 'lease_expired' AND j.state IN ('dead', 'cancelled')
+             FROM job_attempts a JOIN jobs j ON j.id = a.job_id
+             WHERE a.job_id = $1 AND a.attempt = $2",
+        )
+        .bind(id)
+        .bind(attempt)
+        .fetch_one(&pool)
+        .await?;
+        if reaped_and_final {
+            settled_by_reaper += 1;
+        } else {
+            unrecovered += 1;
         }
     }
 
@@ -563,6 +579,7 @@ async fn chaos(o: &Options) -> anyhow::Result<()> {
             "open_attempts": open_attempts,
             "attempt_outcomes": outcomes.iter().map(|(o, n)| (o.clone().unwrap_or_else(|| "open".into()), json!(n))).collect::<serde_json::Map<_, _>>(),
             "recovery_secs": summary(recovery),
+            "orphans_dead_lettered_by_reaper": settled_by_reaper,
             "unrecovered_orphans": unrecovered,
         },
         "checks": checks,
