@@ -1,102 +1,54 @@
 # Failure analysis
 
-What can go wrong, what TaskForge does about it today, and what it does not
-do yet. "Tested" means an automated test injects the failure.
+What can go wrong, what TaskForge does, and which test injects it. "Chaos"
+means the real-process harness (`taskforge-chaos`, see EXPERIMENTS.md); the rest
+are automated tests in `cargo test`.
 
-## 1. Failure modes at Milestone 1
+## Failure modes
 
-| # | Failure | Behaviour today | Tested | Fix |
-|---|---|---|---|---|
-| F1 | Two workers claim at the same instant | Each gets a different job (`SKIP LOCKED`). | yes — `concurrent_claimers_never_receive_the_same_job` (12 claimers, 60 jobs) | — |
-| F2 | Process killed while jobs are queued | Jobs are rows; they are still there on restart and run. | manually — smoke run in README; automated in M2 | automate |
-| F3 | A worker reports under a claim it no longer holds | Rejected with `StaleClaim`; nothing written. | yes — `stale_or_foreign_claims_cannot_settle_a_job`, `losing_the_claim_mid_run_discards_the_outcome` | — |
-| F4 | A late failure report after success (or the reverse) | Rejected; the first committed outcome stands. | yes — `a_settled_job_cannot_be_settled_again` | — |
-| F5 | Application bug attempts an illegal transition | Database trigger refuses it. | yes — all 20 state pairs | — |
-| F6 | Handler returns an error | Job is dead-lettered with the message. **No retry.** | yes | M2: retries with backoff |
-| F7 | Handler panics | Job dead-lettered as "handler panicked"; worker continues. | yes | — |
-| F8 | Job kind has no handler | Rejected at submit (`422`); if it reaches the queue anyway, dead-lettered unrun. | yes (both paths) | — |
-| F9 | Database unreachable — API | `503` + `Retry-After`; `/readyz` fails, `/healthz` stays up. | yes — `health_endpoints` | — |
-| F10 | Database unreachable — idle worker | Worker logs, backs off exponentially (cap 10 s), recovers by itself. | yes — `worker_survives_a_database_outage` | — |
-| **F11** | **Worker dies while running a job** | **Job stays `running` forever.** Nothing recovers it. | no | **M2: heartbeats + lease reaper** |
-| **F12** | **Database fails between handler finishing and the outcome being written** | The outcome is lost and the job stays `running` (same as F11). The work was done but is not recorded. | no | **M2: bounded retry of the settle, then lease recovery (the job re-runs: at-least-once)** |
-| F13 | Client retries a submission whose response was lost | **Two jobs are created.** | yes — documented by `two_identical_submissions_are_two_jobs` | M2: idempotency keys |
-| F14 | Handler runs longer than the lease | Nothing happens in M1 (no reaper). Once a reaper exists this would cause a second concurrent execution. | no | M2: heartbeat renewal + self-fencing |
-| F15 | Handler never returns | The (single) worker is blocked indefinitely. | no | M2: per-job timeout |
+| # | Failure | Behaviour | Evidence |
+|---|---|---|---|
+| F1 | Concurrent claims | Each claimer gets different jobs (`SKIP LOCKED`) | `concurrent_claimers_never_receive_the_same_job` (12 claimers, 60 jobs); `several_workers_share_a_queue_without_running_anything_twice` |
+| F2 | Worker killed mid-job | Lease expires; reaper re-queues with backoff; another worker runs it | `a_crashed_workers_job_is_recovered_and_finished_by_another`; chaos C1–C3 (real `SIGKILL`/`TerminateProcess`) |
+| F3 | Worker partitioned or frozen, still running | Stops its own handler before the lease can expire; its late writes are fenced off | `a_partitioned_worker_stops_before_its_lease_can_expire`; `a_worker_that_cannot_renew_its_lease_stops_itself`; `expired_lease_is_recovered_and_the_zombie_worker_is_fenced_off` |
+| F4 | Stale or forged report | `StaleClaim`, nothing written | `stale_or_foreign_claims_cannot_settle_a_job`; conformance `lease_expiry_recovers_the_job_and_fences_the_old_worker` |
+| F5 | Illegal transition from a code bug | Database trigger refuses it | `database_trigger_enforces_exactly_the_domain_state_machine` (all 20 pairs) |
+| F6 | Handler error | Retry with jittered backoff, dead-letter after `max_attempts`; fatal errors dead-letter at once | `transient_failures_are_retried_until_the_job_succeeds`; `a_job_that_always_fails_is_dead_lettered_after_max_attempts`; conformance `failure_backoff_and_dead_letter` |
+| F7 | Handler panics | Retryable failure; worker continues | `panicking_handler_fails_the_job_but_not_the_worker` |
+| F8 | Handler hangs | Stopped at `timeout_secs`, retried | `a_handler_that_overruns_its_timeout_is_stopped_and_retried` |
+| F9 | Job that kills every worker it lands on | Each lost lease counts as a failure; dead-lettered after `max_attempts` | `a_job_that_keeps_killing_its_workers_is_eventually_dead_lettered` |
+| F10 | Scheduler (reaper) killed | Reaper keeps no state; a restarted one, or the reaper inside any worker, carries on | `concurrent_reapers_recover_each_lease_exactly_once`; chaos C2, C3 |
+| F11 | Database down: API | `503` + `Retry-After`; `/readyz` fails, `/healthz` stays up | `health_endpoints` |
+| F12 | Database down: worker | Claims back off; outcomes retried for up to one lease, then left to lease recovery | `worker_survives_a_database_outage`; `settle_is_retried_through_a_database_outage` |
+| F13 | Database fails between handler finishing and the write | Write retried; if still failing, the lease expires and the job runs again (at-least-once) | `settle_retry_gives_up_at_the_deadline`; chaos (kills land in this window) |
+| F14 | Statement hangs (locks, overload) | `statement_timeout` (5 s) fails it; treated as retryable | `is_unavailable` maps SQLSTATE 57014 |
+| F15 | Client retries a submission | Idempotency key: one job; different request with the same key: `409` | `duplicate_submission_storm_creates_exactly_one_job` (40 concurrent); `concurrent_duplicate_requests_create_one_job` (HTTP); conformance `idempotent_submission`; chaos (every job submitted twice) |
+| F16 | Cancel races completion | First committed write wins; the other is rejected; final state never changes | `cancel_racing_completion_ends_in_exactly_one_final_state` (40 rounds); `cancel_racing_a_claim_never_leaves_a_cancelled_job_running` |
+| F17 | Graceful shutdown with jobs in flight | Finish within the grace period, then release (no failure counted) | `graceful_shutdown_lets_short_jobs_finish_and_hands_long_ones_back` |
+| F18 | Main pool saturated | Heartbeats use a separate pool, so leases are still renewed | Design (DECISIONS 2.4); no automated test |
+| F19 | No reaper running at all | Expired leases pile up; gauge `taskforge_expired_unreaped_leases` rises | Workers reap by default; conformance `purge_and_stats` checks the gauge source |
 
-F11 and F12 are the important gaps: **at Milestone 1 a job can be stranded in
-`running`.** The lease columns and fencing token already exist and are
-written on every claim, so Milestone 2 adds recovery without changing the
-claim/settle protocol.
+## What is not covered
 
-Manual recovery today, if needed:
+- **Handlers that never yield.** Abort, timeout and self-fencing take effect at
+  the next `.await`. A CPU-bound or blocking handler keeps running after its
+  lease is lost. Its result is still rejected by the fencing token, but its side
+  effects are not prevented.
+- **Side effects outside the database.** At-least-once delivery means a
+  non-idempotent handler can repeat an external effect. Chaos runs count how
+  often this would have happened (`jobs_whose_unprotected_side_effect_ran_twice`).
+- **PostgreSQL itself failing over or losing data.** Out of scope. Durability is
+  whatever the PostgreSQL deployment provides (`synchronous_commit = on` here).
+- **Clock-rate drift beyond 10% of a lease.** Self-fencing assumes the worker's
+  clock and the database's run at nearly the same rate.
 
-```sql
--- Re-queue jobs whose lease ran out (legal transition: running -> queued).
-UPDATE jobs SET state = 'queued', lease_owner = NULL, lease_expires_at = NULL
-WHERE state = 'running' AND lease_expires_at < now();
-```
-
-## 2. Security limitations
+## Security limitations
 
 | Area | Status |
 |---|---|
-| Authentication / authorization | **None.** Anyone who can reach the port can submit and read jobs. The API binds to `127.0.0.1` by default for this reason. |
-| TLS | None (API and database connection). Intended to run behind a terminating proxy; database TLS is a SQLx feature flag away. |
-| Database privileges | One role owns the schema and is used by every process. Planned: a migration role and a DML-only application role. |
-| Rate limiting / quotas | None. Body size is limited (65 KiB) but request rate is not. |
-| Arbitrary code execution | Not possible by design: only handlers compiled into the binary run; payloads are data. |
-| Sensitive data | Payloads, results and error messages are stored in plain text and returned by `GET /jobs/{id}`. Handlers must not put secrets in them. Payloads are never logged; error messages are. |
-
-## 3. Unsuccessful approaches
-
-Recorded as they happened, because the reasons are more useful than the fixes.
-
-### 3.1 `localhost` in the database URL — a 200× slowdown
-
-**What was tried.** The default `DATABASE_URL` used `localhost`, and
-`docker-compose.yml` published PostgreSQL on `127.0.0.1` only.
-
-**What happened.** Every test passed, but the storage suite took **188 s**
-(13 tests), the API suite 11 s and the worker suite 24 s. Two tests ran for
-over a minute each. The code under test was not slow: each test opens fresh
-connections, and on Windows `localhost` resolves to IPv6 `::1` first. Nothing
-listens there, and the connection attempt takes about two seconds to fail
-before the IPv4 address is tried — per connection.
-
-**Decision.** Default URLs use `127.0.0.1`, matching the published address.
-The same suites then ran in **0.93 s, 0.52 s and 0.68 s**; the whole workspace
-test run takes about 5 s. The alternative (publishing the port on both
-families) was rejected because it widens what the container listens on to
-work around a client-side default.
-
-**Why it matters beyond tests.** The same two seconds would be added to every
-new pool connection in production on an affected host — invisible in
-steady state, painful exactly when a pool is rebuilding after an outage.
-
-### 3.2 Deriving the heartbeat interval from an assumed lease (Python prototype)
-
-**What was tried.** In the earlier prototype, the worker started with a
-default lease length (30 s), heartbeated every third of that, and learned the
-server's real lease length only from responses.
-
-**What happened.** With a short server-side lease (0.6 s in a test), the
-worker slept ~10 s before its first heartbeat. The lease expired, the job was
-re-queued and re-run, the same thing happened again, and after five attempts
-a perfectly healthy long-running job was dead-lettered. Found by
-`test_heartbeats_keep_a_long_task_leased`.
-
-**Decision for TaskForge.** The lease length has exactly one owner. The worker
-is configured with it, passes it in the claim, and derives its renewal
-interval from that same value — there is no second copy to disagree with
-(Milestone 2).
-
-## 4. Fault-injection plan *(M2–M3)*
-
-| Fault | Injection | Assertion |
-|---|---|---|
-| Worker process killed mid-job | `kill -9` / `TerminateProcess` on a worker subprocess | Job completes on another worker; exactly one committed result; recovery time recorded. |
-| Database connection dropped mid-settle | Proxy or `pg_terminate_backend` between handler and `complete` | Outcome eventually recorded or job re-run; never two results. |
-| Lease expires while handler still running | Short lease, slow handler, heartbeats suppressed | First attempt's result rejected as stale. |
-| Cancel racing completion | Fire both concurrently, many iterations | Final state is `succeeded` or `cancelled`, never changes afterwards. |
-| Duplicate submission storm | N concurrent requests with one idempotency key | Exactly one row. |
-| Whole-system restart under load | Stop everything mid-batch, restart | Every accepted job reaches a terminal state. |
+| Authentication / authorization | **None.** The API binds to `127.0.0.1` by default for this reason |
+| TLS | None, for the API or the database connection |
+| Database privileges | One role owns the schema and is used by every process. Workers never run migrations, so a DML-only role would work, but none is set up |
+| Rate limiting | None; body size is limited |
+| Code execution | Only handlers compiled into the binary run; a job is a name plus JSON. The `chaos` kind is off unless `TASKFORGE_CHAOS_HANDLER=true` |
+| Sensitive data | Payloads, results and errors are stored in plain text and returned by the API; handlers must not put secrets in them. Payloads are not logged |

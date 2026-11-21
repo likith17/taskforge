@@ -1,192 +1,132 @@
-# TaskForge — Architecture
+# Architecture
 
-Status: **Milestone 1 implemented.** Sections describing later milestones are
-marked *(planned)* and describe the intended design, not existing code.
+## Components
 
-## 1. Components
-
-```mermaid
-flowchart LR
-    P[Producers] -- "HTTP: POST /jobs, GET /jobs/{id}" --> API
-    subgraph bin["taskforge binary (one executable, several roles)"]
-        API["API role<br/>taskforge-api (Axum)"]
-        W["Worker role<br/>taskforge-worker (Tokio)"]
-        S["Scheduler role (planned, M2)<br/>lease recovery"]
-    end
-    API -- SQL --> DB[(PostgreSQL<br/>jobs table = the queue)]
-    W -- "claim / settle (SQL)" --> DB
-    S -. "expired leases (SQL)" .-> DB
-    W --> H["Handler registry<br/>(predefined job kinds only)"]
+```
+  producers                                   operators / Prometheus
+     | POST /jobs (Idempotency-Key)                | GET /jobs, /metrics
+     v                                             v
+ +------------------------- taskforge serve --------------------------+
+ |  Axum router (generic over JobStore) · validation · /metrics        |
+ +---------------------------------+-----------------------------------+
+                                   | SQL (one statement per transition)
+                                   v
+ +---------------------------------------------------------------------+
+ |                         PostgreSQL                                   |
+ |  jobs            the queue: state, lease, fencing token, result      |
+ |  job_attempts    one row per delivery: worker, outcome, error        |
+ |  constraints + trigger: illegal states and transitions are refused   |
+ +------^-------------------------^--------------------------^----------+
+        | claim (SKIP LOCKED)     | heartbeat (own pool)     | reap expired leases
+        | complete/fail/release   |                          | purge finished jobs
+ +------+-------------------------+------+          +--------+----------------+
+ |  taskforge worker  (x N processes)    |          | taskforge scheduler     |
+ |  claim loop · semaphore (backpressure)|          | (optional: every worker |
+ |  handler tasks · per-job lease timer  |          |  also runs a reaper)    |
+ |  built-in reaper · /metrics           |          +-------------------------+
+ +---------------------------------------+
 ```
 
-PostgreSQL is the only stateful component and the only coordination
-mechanism. API and worker processes are stateless and can be started,
-stopped and scaled independently. There is no broker and no leader election:
-coordination is row locks and guarded `UPDATE`s (ADR 0001, ADR 0003).
+PostgreSQL is the only stateful component and the only coordinator: there is no
+broker and no leader election. API, worker and scheduler processes are stateless
+and can be killed, restarted and scaled independently. Any number of each may
+run at once.
 
-### Crates
+## Life of a job
 
-| Crate | Responsibility | Depends on |
-|---|---|---|
-| `taskforge-domain` | Pure rules, no I/O: `JobState` and its transition table, `Job`, `NewJob` validation, limits. | serde, uuid, chrono |
-| `taskforge-storage` | Every SQL statement. Migrations, `JobStore` (insert, get, claim, complete, fail), `Claim` fencing token, error taxonomy. | domain, sqlx |
-| `taskforge-api` | Axum router, request validation, error envelope, health endpoints. | domain, storage, axum |
-| `taskforge-worker` | Handler trait and registry, built-in handlers, the claim-execute-settle loop. | domain, storage, tokio |
-| `taskforge` (bin) | Configuration from environment, logging, signal handling, role selection. | all of the above |
-| `taskforge-scheduler` *(planned, M2)* | Lease reaper; later, metrics sampling. | domain, storage |
-
-The split follows the direction of knowledge: `domain` knows nothing,
-`storage` knows SQL, `api` and `worker` each know one protocol, and only the
-binary knows about the process. Each library crate is tested on its own.
-
-## 2. Job state machine
-
-```mermaid
-stateDiagram-v2
-    [*] --> queued: submit
-    queued --> running: claim
-    queued --> cancelled: cancel before start (M2)
-    running --> succeeded: handler returned Ok
-    running --> queued: retry / lease expired / released (M2)
-    running --> dead: retries exhausted or fatal error
-    running --> cancelled: cancellation acknowledged (M2)
-    dead --> queued: operator re-drive (M2)
-    succeeded --> [*]
-    cancelled --> [*]
+```
+ submit ──► queued ──claim──► running ──complete──► succeeded
+              ▲  │              │
+              │  │              ├── fail, retryable, attempts left ──► queued (run_at = now + backoff)
+              │  │              ├── fail, fatal or out of attempts  ──► dead ──re-drive──► queued
+              │  │              ├── lease expired (worker gone)     ──► same rule as fail
+              │  │              ├── cancel acknowledged             ──► cancelled
+              │  │              └── released (graceful shutdown)    ──► queued (no failure counted)
+              │  └── cancel ──► cancelled
 ```
 
-| State | Meaning | Holds a lease? |
-|---|---|---|
-| `queued` | Waiting; not claimable before `run_at`. | no |
-| `running` | Leased to exactly one worker attempt. | yes |
-| `succeeded` | Result committed. Final. | no |
-| `dead` | Dead-lettered: failed, will not be retried automatically. | no |
-| `cancelled` | Cancelled by request. Final. | no |
+1. **Submit.** Validated in the domain crate, fingerprinted, inserted as
+   `queued`. Durable once `201` is returned.
+2. **Claim.** One statement picks the best due job (priority, then `run_at`)
+   with `FOR UPDATE SKIP LOCKED`, sets `running`, increments `attempt` (the
+   fencing token), writes `lease_expires_at = now() + lease`, and opens a
+   `job_attempts` row.
+3. **Run.** The handler runs in its own task. Three things can stop it: its
+   `timeout_secs`, a cancellation seen by the heartbeat, or its own lease timer.
+4. **Heartbeat.** Every `lease/3` the worker renews all its leases in one
+   statement, through a dedicated pool. The response lists leases it no longer
+   holds and jobs someone asked to cancel.
+5. **Settle.** `complete`, `fail`, `release` or `acknowledge_cancel`, each a
+   single `UPDATE ... WHERE id AND state='running' AND lease_owner AND attempt`
+   that also closes the attempt row. If the claim is stale, nothing is written.
+   Writes are retried through database outages for up to one lease; repeats are
+   safe because of the same guard.
+6. **Recover.** Reapers move `running` rows whose lease has expired back through
+   the failure rule (retry with backoff, or dead-letter), using `SKIP LOCKED` so
+   each lease is handled once.
 
-Any transition not in the diagram is invalid. The table is defined once in
-`JobState::can_transition_to` and enforced a second time by the database
-trigger `jobs_enforce_transition`; an integration test walks every pair of
-states and asserts the two agree (ADR 0005).
+## Why two attempts never run at the same time
 
-Milestone 1 uses four of these transitions: submit, claim, succeed, and
-`running -> dead` (there are no retries yet, so every failure dead-letters).
-
-## 3. Data model
-
-Implemented in `crates/storage/migrations/0001_create_jobs.sql`.
-
-| Column | Type | Notes |
-|---|---|---|
-| `id` | uuid PK | UUIDv7, generated by the API: time-ordered, index-friendly. |
-| `queue`, `kind` | text | Validated names (`[a-z][a-z0-9_.-]{0,63}`). |
-| `payload` | jsonb | At most 64 KiB. |
-| `state` | text + CHECK | See state machine. |
-| `priority` | smallint | −100..100, higher first. |
-| `run_at` | timestamptz | Earliest claim time. |
-| `attempt` | integer | Claims so far. **Fencing token.** Never decreases (trigger). |
-| `lease_owner`, `lease_expires_at` | text, timestamptz | Set exactly while `running` (CHECK). |
-| `result` | jsonb | Only when `succeeded` (CHECK). |
-| `last_error` | text | Truncated to 4 KiB. |
-| `created_at`, `updated_at`, `started_at`, `finished_at` | timestamptz | `finished_at` set exactly in terminal states (CHECK). |
-
-Indexes:
-
-- `jobs_claim_idx (queue, priority DESC, run_at, id) WHERE state = 'queued'` —
-  the claim path. Partial, so finished jobs never bloat it.
-- `jobs_lease_idx (lease_expires_at) WHERE state = 'running'` — the lease
-  recovery path (used from M2).
-
-Planned additions *(M2, as migration 0002)*: `max_attempts`, `failures`,
-`idempotency_key` (+ partial unique index), `request_hash`,
-`cancel_requested`, `timeout_ms`, and a `job_attempts` history table.
-
-All time comparisons use the database clock (`now()`), so the clocks of API
-and worker machines never have to agree.
-
-## 4. The claim/settle protocol
-
-```mermaid
-sequenceDiagram
-    participant W as Worker
-    participant DB as PostgreSQL
-    W->>DB: claim_next: SELECT ... FOR UPDATE SKIP LOCKED + UPDATE (one statement)
-    DB-->>W: job row, attempt = n  (Claim{job, worker, n})
-    Note over W: run registered handler in its own task
-    W->>DB: complete: UPDATE ... WHERE id AND state='running' AND lease_owner=worker AND attempt=n
-    alt guard matched
-        DB-->>W: succeeded
-    else guard did not match
-        DB-->>W: StaleClaim (nothing written)
-    end
+```
+ worker A    claim sent ─┐                         A's local deadline (0.9 × lease)
+                         │  ◄─────── lease ───────►│     │
+ database                └► lease written ────────────────────► expiry ──► reaper may re-queue
+                                                         ▲
+                                                 A has stopped by here
 ```
 
-- **Atomic claiming.** One statement selects the best candidate with
-  `FOR UPDATE SKIP LOCKED` and updates it. Concurrent claimers skip each
-  other's locked rows instead of waiting or double-claiming.
-- **Fencing.** Every claim increments `attempt`. Settling requires presenting
-  the `Claim` (job, worker id, attempt), and the `UPDATE` only matches if all
-  three still describe the row. A worker that was superseded — however late it
-  reports — matches nothing and is told `StaleClaim`. The `Claim` type has
-  private fields: outside the storage crate it can only be obtained by
-  claiming.
-- **No lost updates.** Every state change is a single conditional `UPDATE`;
-  there is no read-modify-write in application code.
+The worker's deadline is measured from when it *sent* the claim or renewal,
+which is no later than when the database wrote it. Fencing at 90% leaves a
+margin for clock-rate drift and abort latency. Even if a handler somehow
+outlived its lease, its result would be rejected by the fencing token. The
+guarantee does not cover handlers that never yield (CPU-bound or blocking
+code), because abort only lands at an `.await`.
 
-## 5. Delivery semantics
+## Code structure
 
-**Job execution is at-least-once. TaskForge does not claim exactly-once
-execution.**
+```
+ domain      pure rules: JobState, decide_failure, RetryPolicy, validation,
+   ▲         request fingerprint, Clock, Jitter                   (no I/O)
+   │
+ storage     trait JobStore ── PgJobStore  (all SQL; DB clock; Jitter injected)
+   ▲                       └── MemJobStore (Clock + Jitter injected; pure rules)
+   │         conformance tests: same scenarios, both stores
+   │
+ api · worker · scheduler      generic over S: JobStore
+   ▲
+ taskforge (binary)            config, roles, pools, chaos job kind
+ chaos (binary)                real-process fault injection and benchmarks
+```
 
-A worker can finish a handler and die before recording that it did. The system
-cannot distinguish that from a worker that died before starting, so (from M2)
-it runs the job again. No design removes this; it can only be moved.
+The worker, reaper and API never touch SQL. They depend on the `JobStore`
+contract, so a deterministic simulation can run them on `MemJobStore` with a
+`ManualClock` and a seeded `SplitMix64`. DECISIONS.md 3.1 explains why the
+PostgreSQL store expresses the rules in SQL rather than calling the domain
+functions, and how the conformance tests keep the two in step.
 
-What TaskForge does guarantee:
+## Data model
 
-| Guarantee | Mechanism | Status |
-|---|---|---|
-| An accepted job is durable | Row committed before `201` is returned | M1 |
-| A job is leased to at most one attempt at a time | `SKIP LOCKED` + lease CHECK constraint | M1 |
-| At most one result is committed per job | Fenced settle + trigger makes `succeeded` final | M1 |
-| A retried *submission* creates one job | Idempotency key + unique index | planned, M2 |
-| Abandoned jobs are recovered | Lease expiry + reaper | planned, M2 |
+`jobs` (migrations `0001`–`0003`):
 
-Two different kinds of "duplicate" must not be confused:
+| Column | Notes |
+|---|---|
+| `id` uuid | UUIDv7 from the API |
+| `queue`, `kind`, `payload` jsonb, `priority` | Validated input |
+| `state` | `CHECK` + transition trigger |
+| `run_at` | Earliest claim time; moved forward by backoff |
+| `attempt` | Fencing token; trigger forbids decrease |
+| `failures`, `max_attempts`, `timeout_secs` | Retry budget and per-attempt limit |
+| `lease_owner`, `lease_expires_at` | Set exactly while `running` (`CHECK`) |
+| `idempotency_key` (unique, partial), `request_hash` | Exactly-once submission |
+| `cancel_requested` | Pending cancellation for a running job |
+| `result`, `last_error` | `result` only when `succeeded` (`CHECK`) |
+| `created_at`, `updated_at`, `started_at`, `finished_at` | `finished_at` exactly in terminal states (`CHECK`) |
 
-- **Duplicate submission** — the client sends the same request twice.
-  Preventable by the platform (idempotency keys, M2).
-- **Duplicate side effect** — a handler runs twice and charges a card twice.
-  *Not* preventable by the platform alone. Handlers receive a stable job id
-  (`JobContext::job_id`) to pass downstream as an idempotency key, or must be
-  naturally idempotent.
+Indexes: claim path `(queue, priority DESC, run_at, id) WHERE state='queued'`;
+reaper `(lease_expires_at) WHERE state='running'`; purge
+`(finished_at) WHERE finished_at IS NOT NULL`; listing `(state, id DESC)`;
+idempotency `UNIQUE (idempotency_key) WHERE idempotency_key IS NOT NULL`.
 
-## 6. Planned reliability design *(M2)*
-
-- **Leases and heartbeats.** The worker renews `lease_expires_at` every
-  `lease / 3` with the same fenced guard. Renewal failure for longer than the
-  lease means the worker must assume it has been superseded and stop.
-- **Recovery.** A scheduler loop moves `running` rows with an expired lease
-  back to `queued` (or to `dead` when attempts are exhausted), selecting with
-  `SKIP LOCKED` so several scheduler instances are safe.
-- **Retries.** Exponential backoff with jitter, computed in `domain` as a pure
-  function (property-tested), applied as `run_at`.
-- **Cancellation race rule.** *The first committed write wins.* Cancelling a
-  running job sets `cancel_requested`; the worker learns of it at the next
-  heartbeat. If the handler's `complete` commits first, the job is
-  `succeeded` and the cancel request reports that it was too late. If the
-  worker acknowledges first, the job is `cancelled` and a later `complete` is
-  rejected as stale. Both outcomes are final; neither can overwrite the other.
-
-## 7. Configuration and security posture
-
-- Configuration and secrets come only from environment variables; nothing
-  secret is committed (the repository default is a throwaway local password).
-- Only registered handlers run. Unknown kinds are rejected at submission
-  (`422`) and again by the worker.
-- Input is validated in `domain` (names, priority, schedule, payload size) and
-  bounded at the HTTP layer (body limit, `413`).
-- Database errors are logged server-side and never returned to clients.
-- **Not implemented:** authentication, authorization, TLS, rate limiting,
-  least-privilege database roles (the single dev role owns the schema). The
-  API binds to loopback by default for this reason. See
-  [FAILURE_ANALYSIS.md](FAILURE_ANALYSIS.md).
+`job_attempts (job_id, attempt)` records one row per delivery: worker,
+`started_at`, `finished_at`, outcome and error. An outcome of `NULL` means the
+attempt is in flight.
