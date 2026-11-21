@@ -505,10 +505,30 @@ async fn chaos(o: &Options) -> anyhow::Result<()> {
     // attempt. An orphan whose attempt was its last (a deliberately failing
     // job on attempt 3) is not re-run: the reaper takes it back and
     // dead-letters it, which also counts as recovered.
+    //
+    // Two latencies per orphan, both on the database clock:
+    // * requeue: kill -> the reaper takes the job back. This is the recovery
+    //   mechanism itself (lease expiry + reaper interval).
+    // * restart: kill -> its next attempt starts. Adds the retry backoff and
+    //   any wait behind other queued jobs, which dominates when the queue is
+    //   saturated.
     let mut recovery = Vec::new();
+    let mut requeue = Vec::new();
     let mut settled_by_reaper = 0;
     let mut unrecovered = 0;
     for (id, attempt, killed_at) in &orphans {
+        let taken_back: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT finished_at FROM job_attempts
+             WHERE job_id = $1 AND attempt = $2 AND outcome = 'lease_expired'",
+        )
+        .bind(id)
+        .bind(attempt)
+        .fetch_optional(&pool)
+        .await?
+        .flatten();
+        if let Some(at) = taken_back {
+            requeue.push((at - *killed_at).num_microseconds().unwrap_or(0) as f64 / 1e6);
+        }
         let next: Option<DateTime<Utc>> = sqlx::query_scalar(
             "SELECT started_at FROM job_attempts WHERE job_id = $1 AND attempt = $2",
         )
@@ -578,7 +598,8 @@ async fn chaos(o: &Options) -> anyhow::Result<()> {
             "stuck_leases": stuck_leases,
             "open_attempts": open_attempts,
             "attempt_outcomes": outcomes.iter().map(|(o, n)| (o.clone().unwrap_or_else(|| "open".into()), json!(n))).collect::<serde_json::Map<_, _>>(),
-            "recovery_secs": summary(recovery),
+            "requeue_latency_secs": summary(requeue),
+            "restart_latency_secs": summary(recovery),
             "orphans_dead_lettered_by_reaper": settled_by_reaper,
             "unrecovered_orphans": unrecovered,
         },
