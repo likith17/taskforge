@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Overrides the local default in .cargo/config.toml.
+  DATABASE_URL: postgres://taskforge:taskforge@127.0.0.1:5432/taskforge
+  CHAOS_ADMIN_URL: postgres://taskforge:taskforge@127.0.0.1:5432/postgres
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: taskforge
+          POSTGRES_PASSWORD: taskforge # throwaway CI credential
+          POSTGRES_DB: taskforge
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U taskforge -d taskforge"
+          --health-interval 2s --health-timeout 2s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85.0"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test (unit, property, integration against PostgreSQL)
+        run: cargo test --workspace
+
+      - name: Build release binaries
+        run: cargo build --release -p taskforge -p taskforge-chaos
+      - name: Chaos smoke run (real processes, SIGKILL)
+        run: >
+          ./target/release/taskforge-chaos chaos --name ci --jobs 200 --workers 4
+          --kill-every-ms 700 --scheduler-kill-every-ms 3000 --timeout-secs 300
+      - name: Keep chaos results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-results
+          path: experiments/
