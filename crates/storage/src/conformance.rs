@@ -373,10 +373,12 @@ async fn idempotent_submission(f: &impl Fixture) {
         .await;
     assert!(matches!(other, Err(StoreError::IdempotencyConflict { .. })));
 
-    // Regression test: a retry whose payload the database normalises
-    // (1e2 is stored and returned as 100) is still the same request.
+    // Regression test. serde prints the float 1e16 as "1e16"; jsonb stores
+    // it as the numeric 10000000000000000 and returns it in that form, which
+    // serde then reads back as an *integer*. Comparing stored payloads called
+    // this genuine retry a conflict; comparing request fingerprints does not.
     let sci = || {
-        from_json(r#"{"kind":"echo","payload":{"n":1e2}}"#)
+        from_json(r#"{"kind":"echo","payload":{"n":1e16}}"#)
             .with_idempotency_key(IdempotencyKey::parse("sci").unwrap())
     };
     let first = s.submit(&sci()).await.unwrap();

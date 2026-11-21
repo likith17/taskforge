@@ -222,10 +222,11 @@ impl NewJob {
     ///
     /// Stored with the job so that a repeated idempotency key can be checked
     /// against the *original request*, not against the stored row. The row is
-    /// not a faithful copy: PostgreSQL's `jsonb` normalises numbers (`1e2`
-    /// comes back as `100`), and `serde_json` considers the float `100.0` and
-    /// the integer `100` different values. Comparing rows rejected genuine
-    /// retries; comparing fingerprints of what the client sent does not.
+    /// not a faithful copy: `serde_json` writes the float `1e16` as `1e16`,
+    /// PostgreSQL's `jsonb` returns it as `10000000000000000`, and `serde_json`
+    /// reads that back as an integer, which is not equal to the float.
+    /// Comparing rows rejected such genuine retries as conflicts; comparing
+    /// fingerprints of what the client sent does not.
     ///
     /// The schedule is deliberately left out: a relative `delay_ms` resolves
     /// to a different instant on every retry of the same request.
@@ -637,11 +638,12 @@ mod tests {
 
     #[test]
     fn a_retry_matches_its_stored_job_even_after_number_normalisation() {
-        // The client sends 1e2. PostgreSQL jsonb hands it back as 100, and
-        // serde_json says Number(100.0) != Number(100): comparing payloads
-        // would call this genuine retry a conflict.
-        let original = from_json(r#"{"kind":"echo","payload":{"n":1e2}}"#);
-        let stored_payload: Value = serde_json::from_str(r#"{"n":100}"#).unwrap();
+        // The client sends the float 1e16. PostgreSQL jsonb hands it back as
+        // 10000000000000000, which serde_json reads as an integer, and
+        // Number(1e16) != Number(10000000000000000): comparing payloads would
+        // call this genuine retry a conflict.
+        let original = from_json(r#"{"kind":"echo","payload":{"n":1e16}}"#);
+        let stored_payload: Value = serde_json::from_str(r#"{"n":10000000000000000}"#).unwrap();
         assert_ne!(original.payload(), &stored_payload, "the trap is real");
 
         let stored = Job {
@@ -668,7 +670,7 @@ mod tests {
             started_at: None,
             finished_at: None,
         };
-        let retry = from_json(r#"{"kind":"echo","payload":{"n":1e2}}"#);
+        let retry = from_json(r#"{"kind":"echo","payload":{"n":1e16}}"#);
         assert!(retry.same_request_as(&stored));
         let other = from_json(r#"{"kind":"echo","payload":{"n":101}}"#);
         assert!(!other.same_request_as(&stored));
