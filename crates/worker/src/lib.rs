@@ -7,7 +7,9 @@
 
 pub mod handlers;
 mod registry;
+mod time;
 mod worker;
 
 pub use registry::{HandlerError, HandlerFuture, HandlerRegistry, JobContext, JobHandler};
+pub use time::{LocalTime, TokioTime};
 pub use worker::{Outcome, Worker, WorkerConfig};

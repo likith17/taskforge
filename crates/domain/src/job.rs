@@ -206,6 +206,20 @@ impl NewJob {
         self
     }
 
+    /// Replace the generated id.
+    ///
+    /// [`JobId::new`] reads the wall clock and the OS random source, so two
+    /// runs never produce the same ids. A deterministic simulation needs ids
+    /// that follow from its seed instead (and stay time-ordered, since stores
+    /// order jobs by id). Production code has no reason to call this.
+    ///
+    /// The id is not part of [`NewJob::request_hash`], so it does not affect
+    /// idempotency checks.
+    pub fn with_id(mut self, id: JobId) -> Self {
+        self.id = id;
+        self
+    }
+
     pub fn idempotency_key(&self) -> Option<&IdempotencyKey> {
         self.idempotency_key.as_ref()
     }
@@ -682,5 +696,15 @@ mod tests {
         assert!(job.idempotency_key().is_none());
         let keyed = job.with_idempotency_key(IdempotencyKey::parse("k1").unwrap());
         assert_eq!(keyed.idempotency_key().unwrap().as_str(), "k1");
+    }
+
+    #[test]
+    fn with_id_replaces_the_id_and_nothing_else() {
+        let job = NewJob::try_from(submission("echo")).unwrap();
+        let id = JobId::from_uuid(uuid::Uuid::from_u128(42));
+        let renamed = job.clone().with_id(id);
+        assert_eq!(renamed.id(), id);
+        assert_eq!(renamed.request_hash(), job.request_hash());
+        assert_eq!(renamed.with_id(job.id()), job);
     }
 }

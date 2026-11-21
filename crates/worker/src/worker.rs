@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -12,7 +12,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tracing::Instrument;
 
-use crate::{HandlerRegistry, JobContext};
+use crate::{HandlerRegistry, JobContext, LocalTime, TokioTime};
 
 /// The worker stops a handler once this fraction of the lease has passed
 /// without a successful renewal. See [`Inner::execute`] for why it is less
@@ -118,7 +118,10 @@ struct Inner<S> {
     registry: HandlerRegistry,
     config: WorkerConfig,
     metrics: Arc<Metrics>,
-    active: Mutex<HashMap<JobId, Active>>,
+    /// Every deadline, sleep and tick of this worker is measured on this
+    /// clock. See [`LocalTime`].
+    time: Arc<dyn LocalTime>,
+    active: Mutex<BTreeMap<JobId, Active>>,
 }
 
 pub struct Worker<S> {
@@ -142,7 +145,8 @@ impl<S: JobStore> Worker<S> {
                 registry,
                 config,
                 metrics: Metrics::shared(),
-                active: Mutex::new(HashMap::new()),
+                time: Arc::new(TokioTime),
+                active: Mutex::new(BTreeMap::new()),
             }),
         }
     }
@@ -161,6 +165,14 @@ impl<S: JobStore> Worker<S> {
     /// serves).
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.configure().metrics = metrics;
+        self
+    }
+
+    /// Measure this worker's deadlines, sleeps and heartbeat ticks on `time`
+    /// instead of Tokio's clock. For simulations that give each worker a
+    /// timer running at its own rate.
+    pub fn with_local_time(mut self, time: Arc<dyn LocalTime>) -> Self {
+        self.configure().time = time;
         self
     }
 
@@ -214,7 +226,7 @@ impl<S: JobStore> Worker<S> {
                 permits.push(permit);
             }
 
-            let sent_at = Instant::now();
+            let sent_at = inner.time.now();
             let claimed = inner
                 .store
                 .claim(
@@ -224,7 +236,13 @@ impl<S: JobStore> Worker<S> {
                     permits.len() as u32,
                 )
                 .await;
-            inner.metrics.claim_took(sent_at.elapsed().as_secs_f64());
+            inner.metrics.claim_took(
+                inner
+                    .time
+                    .now()
+                    .saturating_duration_since(sent_at)
+                    .as_secs_f64(),
+            );
             let pause = match claimed {
                 Ok(claimed) if !claimed.is_empty() => {
                     consecutive_errors = 0;
@@ -250,7 +268,7 @@ impl<S: JobStore> Worker<S> {
             };
             drop(permits);
             tokio::select! {
-                _ = tokio::time::sleep(pause) => {}
+                _ = inner.time.sleep(pause) => {}
                 _ = stop_requested(&mut shutdown) => break,
             }
         }
@@ -269,10 +287,13 @@ impl<S: JobStore> Worker<S> {
             ?grace,
             "draining: waiting for running jobs"
         );
+        let time = &self.inner.time;
         let finished_in_time =
-            tokio::time::timeout(grace, async { while jobs.join_next().await.is_some() {} })
-                .await
-                .is_ok();
+            tokio::time::timeout_at(time.runtime_instant(time.deadline_in(grace)), async {
+                while jobs.join_next().await.is_some() {}
+            })
+            .await
+            .is_ok();
         if finished_in_time {
             return;
         }
@@ -287,9 +308,10 @@ impl<S: JobStore> Worker<S> {
         // Stopping and releasing is quick; bound it anyway so a dead database
         // cannot hold the process hostage. Anything left is recovered by lease
         // expiry.
-        let _ = tokio::time::timeout(Duration::from_secs(10), async {
-            while jobs.join_next().await.is_some() {}
-        })
+        let _ = tokio::time::timeout_at(
+            time.runtime_instant(time.deadline_in(Duration::from_secs(10))),
+            async { while jobs.join_next().await.is_some() {} },
+        )
         .await;
     }
 
@@ -299,7 +321,7 @@ impl<S: JobStore> Worker<S> {
     /// within one lease. Returns `Ok(None)` when nothing was runnable.
     pub async fn run_once(&self) -> Result<Option<Outcome>, StoreError> {
         let config = &self.inner.config;
-        let sent_at = Instant::now();
+        let sent_at = self.inner.time.now();
         let Some(job) = self
             .inner
             .store
@@ -313,7 +335,7 @@ impl<S: JobStore> Worker<S> {
 }
 
 impl<S: JobStore> Inner<S> {
-    fn active(&self) -> MutexGuard<'_, HashMap<JobId, Active>> {
+    fn active(&self) -> MutexGuard<'_, BTreeMap<JobId, Active>> {
         // A panic while holding the lock cannot leave the map inconsistent
         // (every critical section is a single insert/remove/read), so a
         // poisoned lock is safe to keep using.
@@ -366,11 +388,16 @@ impl<S: JobStore> Inner<S> {
                 attempt: job.attempt,
                 worker_id: claim.worker_id().to_owned(),
             };
-            let started = Instant::now();
+            let started = self.time.now();
             let verdict = self
                 .execute(ctx, job.payload, timeout, stop_rx, valid_rx)
                 .await;
-            self.metrics.executed_for(started.elapsed().as_secs_f64());
+            self.metrics.executed_for(
+                self.time
+                    .now()
+                    .saturating_duration_since(started)
+                    .as_secs_f64(),
+            );
             // From here on stop signals are ignored: the handler is finished
             // and only the outcome remains to be written. Heartbeats keep the
             // lease alive meanwhile, and the write is fenced regardless.
@@ -410,7 +437,7 @@ impl<S: JobStore> Inner<S> {
         // A separate task, so a panicking handler takes down neither this
         // worker nor the process. Aborted if we are dropped.
         let mut task = AbortOnDrop(tokio::spawn(handler.run(ctx, payload)));
-        let timeout_at = Instant::now() + timeout;
+        let timeout_at = self.time.now() + timeout;
         let mut renewals_open = true;
 
         loop {
@@ -435,11 +462,11 @@ impl<S: JobStore> Inner<S> {
                     },
                 },
                 reason = stop_signal(&mut stop) => Verdict::Stopped(reason),
-                () = tokio::time::sleep_until(deadline) => {
+                () = self.time.sleep_until(deadline) => {
                     tracing::warn!("lease could not be renewed in time; stopping the handler");
                     Verdict::Stopped(Stop::LeaseLost)
                 }
-                () = tokio::time::sleep_until(timeout_at) => Verdict::Failed {
+                () = self.time.sleep_until(timeout_at) => Verdict::Failed {
                     error: format!("timed out after {}s", timeout.as_secs()),
                     retryable: true,
                 },
@@ -462,21 +489,22 @@ impl<S: JobStore> Inner<S> {
         let id = claim.job_id();
         // Keep trying through a database outage for as long as the lease could
         // plausibly still be ours; after that the reaper owns the job.
-        let deadline = Instant::now() + self.config.lease;
+        let time = &*self.time;
+        let deadline = time.now() + self.config.lease;
         let store = &self.store;
 
         let written = match &verdict {
             Verdict::Done(result) => {
-                retry_unavailable(deadline, || store.complete(claim, result)).await
+                retry_unavailable(time, deadline, || store.complete(claim, result)).await
             }
             Verdict::Failed { error, retryable } => {
-                retry_unavailable(deadline, || store.fail(claim, error, *retryable)).await
+                retry_unavailable(time, deadline, || store.fail(claim, error, *retryable)).await
             }
             Verdict::Stopped(Stop::Cancelled) => {
-                retry_unavailable(deadline, || store.acknowledge_cancel(claim)).await
+                retry_unavailable(time, deadline, || store.acknowledge_cancel(claim)).await
             }
             Verdict::Stopped(Stop::Shutdown) => {
-                retry_unavailable(deadline, || store.release(claim)).await
+                retry_unavailable(time, deadline, || store.release(claim)).await
             }
             Verdict::Stopped(Stop::LeaseLost) => {
                 // Not ours any more: there is nothing we are allowed to write.
@@ -531,7 +559,9 @@ impl<S: JobStore> Inner<S> {
 /// Renew every held lease each `lease / 3`, and act on what comes back.
 async fn heartbeat_loop<S: JobStore>(inner: Arc<Inner<S>>) {
     let lease = inner.config.lease;
-    let mut ticker = tokio::time::interval((lease / 3).max(Duration::from_millis(10)));
+    let mut ticker = inner
+        .time
+        .interval((lease / 3).max(Duration::from_millis(10)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await; // the first tick is immediate; a fresh claim needs no renewal
 
@@ -541,7 +571,7 @@ async fn heartbeat_loop<S: JobStore>(inner: Arc<Inner<S>>) {
         if claims.is_empty() {
             continue;
         }
-        let sent_at = Instant::now();
+        let sent_at = inner.time.now();
         match inner
             .heartbeat_store
             .heartbeat(&inner.config.worker_id, &claims, lease)
@@ -581,7 +611,11 @@ async fn heartbeat_loop<S: JobStore>(inner: Arc<Inner<S>>) {
 /// Safe because every settle statement is fenced: if an earlier try did reach
 /// the database, the repeat finds the job no longer running under this claim
 /// and gets `StaleClaim` rather than applying twice.
-async fn retry_unavailable<T, F, Fut>(deadline: Instant, mut op: F) -> Result<T, StoreError>
+async fn retry_unavailable<T, F, Fut>(
+    time: &dyn LocalTime,
+    deadline: Instant,
+    mut op: F,
+) -> Result<T, StoreError>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, StoreError>>,
@@ -589,9 +623,9 @@ where
     let mut pause = Duration::from_millis(100);
     loop {
         match op().await {
-            Err(err) if err.is_unavailable() && Instant::now() + pause < deadline => {
+            Err(err) if err.is_unavailable() && time.now() + pause < deadline => {
                 tracing::warn!(error = %err, retry_in = ?pause, "database unavailable; retrying");
-                tokio::time::sleep(pause).await;
+                time.sleep(pause).await;
                 pause = (pause * 2).min(Duration::from_secs(2));
             }
             other => return other,
@@ -639,7 +673,7 @@ impl<T> Drop for AbortOnDrop<T> {
 
 /// Removes a job from the active set when dropped.
 struct Registered<'a> {
-    active: &'a Mutex<HashMap<JobId, Active>>,
+    active: &'a Mutex<BTreeMap<JobId, Active>>,
     job_id: JobId,
 }
 
@@ -677,7 +711,7 @@ mod tests {
     async fn settle_is_retried_through_a_database_outage() {
         let calls = AtomicU32::new(0);
         let started = Instant::now();
-        let result = retry_unavailable(started + Duration::from_secs(30), || async {
+        let result = retry_unavailable(&TokioTime, started + Duration::from_secs(30), || async {
             // Down for the first three tries, then back.
             if calls.fetch_add(1, Ordering::SeqCst) < 3 {
                 Err(unavailable())
@@ -697,7 +731,7 @@ mod tests {
         let calls = AtomicU32::new(0);
         let started = Instant::now();
         let deadline = started + Duration::from_secs(5);
-        let result: Result<(), _> = retry_unavailable(deadline, || async {
+        let result: Result<(), _> = retry_unavailable(&TokioTime, deadline, || async {
             calls.fetch_add(1, Ordering::SeqCst);
             Err(unavailable())
         })
@@ -713,12 +747,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn other_errors_are_not_retried() {
         let calls = AtomicU32::new(0);
-        let result: Result<(), _> =
-            retry_unavailable(Instant::now() + Duration::from_secs(30), || async {
+        let result: Result<(), _> = retry_unavailable(
+            &TokioTime,
+            Instant::now() + Duration::from_secs(30),
+            || async {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Err(StoreError::Corrupt("not a connectivity problem".to_owned()))
-            })
-            .await;
+            },
+        )
+        .await;
         assert!(matches!(result, Err(StoreError::Corrupt(_))));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
