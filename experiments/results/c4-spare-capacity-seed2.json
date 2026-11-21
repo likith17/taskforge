@@ -11,56 +11,63 @@
     "no stuck leases": true
   },
   "config": {
-    "concurrency_per_worker": 2,
-    "deliberately_failing_jobs": 3,
-    "jobs": 60,
-    "kill_every_ms": 1500,
+    "concurrency_per_worker": 6,
+    "deliberately_failing_jobs": 0,
+    "jobs": 40,
+    "kill_every_ms": 700,
     "lease_ms": 2000,
     "reap_interval_ms": 250,
     "retry_base_ms": 250,
     "retry_cap_ms": 2000,
     "scheduler_down_ms": 1000,
     "scheduler_kill_every_ms": 0,
-    "seed": 1,
-    "work_ms": "20..420",
+    "seed": 2,
+    "work_ms": "20..4020",
     "worker_reaper": false,
-    "workers": 3
+    "workers": 8
   },
-  "elapsed_secs": 4.142,
+  "elapsed_secs": 24.627,
   "experiment": "chaos",
   "kills": {
-    "orphaned_attempts": 2,
+    "orphaned_attempts": 21,
     "scheduler": 0,
-    "workers": 2
+    "workers": 33
   },
-  "name": "smoke",
+  "name": "c4-spare-capacity-seed2",
   "passed": true,
   "results": {
     "attempt_outcomes": {
-      "failed": 9,
-      "lease_expired": 2,
-      "succeeded": 57
+      "lease_expired": 21,
+      "succeeded": 40
     },
     "completion_rate_healthy_jobs": 1.0,
-    "dead_lettered": 3,
+    "dead_lettered": 0,
     "duplicate_committed_results": 0,
-    "duplicate_submissions_answered": 60,
-    "handler_executions": 68,
-    "healthy_jobs_executed_more_than_once": 2,
-    "jobs_in_database": 60,
+    "duplicate_submissions_answered": 40,
+    "handler_executions": 61,
+    "healthy_jobs_executed_more_than_once": 9,
+    "jobs_in_database": 40,
     "jobs_whose_unprotected_side_effect_ran_twice": 0,
     "open_attempts": 0,
     "orphans_dead_lettered_by_reaper": 0,
-    "recovery_secs": {
-      "max": 2.144,
-      "mean": 2.113,
-      "n": 2,
-      "p50": 2.083,
-      "p95": 2.144,
-      "p99": 2.144
+    "requeue_latency_secs": {
+      "max": 2.195,
+      "mean": 1.905,
+      "n": 21,
+      "p50": 1.962,
+      "p95": 2.195,
+      "p99": 2.195
+    },
+    "restart_latency_secs": {
+      "max": 3.858,
+      "mean": 2.528,
+      "n": 21,
+      "p50": 2.35,
+      "p95": 3.722,
+      "p99": 3.858
     },
     "stuck_leases": 0,
-    "succeeded": 57,
+    "succeeded": 40,
     "unrecovered_orphans": 0
   }
 }

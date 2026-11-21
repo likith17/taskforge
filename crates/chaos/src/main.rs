@@ -3,6 +3,7 @@
 //! ```text
 //! taskforge-chaos chaos [options]   kill workers (and the scheduler) mid-job, verify invariants
 //! taskforge-chaos bench [options]   throughput at several worker counts
+//! taskforge-chaos claims [options]  claim strategies compared: naive, FOR UPDATE, SKIP LOCKED
 //! ```
 //!
 //! Both start real `taskforge` processes against a fresh database and kill
@@ -42,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
     match command.as_str() {
         "chaos" => chaos(&options).await,
         "bench" => bench(&options).await,
+        "claims" => claims(&options).await,
         _ => bail!("{USAGE}"),
     }
 }
@@ -755,6 +757,175 @@ async fn bench(o: &Options) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(&report)?);
     println!("written to {}", save(&name, &report)?.display());
     Ok(())
+}
+
+// ------------------------------------------------------------------- claims
+
+/// The baseline comparison: three ways to take the next job, on a bare table
+/// so that nothing but the claim strategy differs.
+///
+/// * `naive`       - `SELECT` the next queued row, then `UPDATE` it. No lock.
+/// * `for_update`  - the same in a transaction with `SELECT ... FOR UPDATE`.
+/// * `skip_locked` - TaskForge's single statement with `FOR UPDATE SKIP LOCKED`.
+///
+/// Every claim is recorded, so double claims (two claimers taking the same
+/// job) are counted exactly.
+///
+/// Options: `--name`, `--jobs 5000`, `--claimers-list 1,4,16`, `--repeats 3`.
+async fn claims(o: &Options) -> anyhow::Result<()> {
+    let name = o.string("name", "claims");
+    let jobs: i64 = o.get("jobs", 5000)?;
+    let repeats: usize = o.get("repeats", 3)?;
+    let counts: Vec<usize> = o
+        .string("claimers-list", "1,4,16")
+        .split(',')
+        .map(|s| s.trim().parse())
+        .collect::<Result<_, _>>()?;
+    let env = Env::new(o, &name)?;
+    let db = "taskforge_claims";
+
+    let mut rows = Vec::new();
+    for strategy in ["naive", "for_update", "skip_locked"] {
+        for &claimers in &counts {
+            let mut runs = Vec::new();
+            for repeat in 1..=repeats {
+                let run = claim_run(&env, db, strategy, claimers, jobs).await?;
+                println!(
+                    "  {strategy:<11} x {claimers:>2} claimers, run {repeat}: {} jobs/s, {} double claims",
+                    run["jobs_per_sec"], run["double_claims"]
+                );
+                runs.push(run);
+            }
+            let mut tp: Vec<f64> = runs
+                .iter()
+                .map(|r| r["jobs_per_sec"].as_f64().unwrap_or(f64::NAN))
+                .collect();
+            tp.sort_by(f64::total_cmp);
+            let doubles: i64 = runs
+                .iter()
+                .map(|r| r["double_claims"].as_i64().unwrap_or(0))
+                .sum();
+            rows.push(json!({
+                "strategy": strategy,
+                "claimers": claimers,
+                "jobs_per_sec_median": round3(percentile(&tp, 50.0)),
+                "jobs_per_sec_min": round3(tp[0]),
+                "jobs_per_sec_max": round3(tp[tp.len() - 1]),
+                "double_claims_total": doubles,
+                "runs": runs,
+            }));
+        }
+    }
+    let report = json!({
+        "experiment": "claims",
+        "name": name,
+        "config": {
+            "jobs_per_run": jobs,
+            "repeats": repeats,
+            "claimers": counts,
+            "note": "bare table; one claim = the strategy's claim statement(s) plus one INSERT recording it",
+        },
+        "results": rows,
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    println!("written to {}", save(&name, &report)?.display());
+    Ok(())
+}
+
+async fn claim_run(
+    env: &Env,
+    db: &str,
+    strategy: &'static str,
+    claimers: usize,
+    jobs: i64,
+) -> anyhow::Result<Value> {
+    let pool = env.fresh_database(db).await?;
+    for ddl in [
+        "CREATE TABLE q (id bigint PRIMARY KEY, state text NOT NULL DEFAULT 'queued')",
+        "CREATE INDEX q_queued ON q (id) WHERE state = 'queued'",
+        "CREATE TABLE claims (id bigint NOT NULL, claimer int NOT NULL)",
+    ] {
+        sqlx::query(ddl).execute(&pool).await?;
+    }
+    sqlx::query("INSERT INTO q (id) SELECT generate_series(1, $1)")
+        .bind(jobs)
+        .execute(&pool)
+        .await?;
+    let claim_pool = PgPoolOptions::new()
+        .max_connections(claimers as u32)
+        .connect(&env.database_url(db))
+        .await?;
+
+    let started = Instant::now();
+    let mut tasks = Vec::new();
+    for claimer in 0..claimers as i32 {
+        let pool = claim_pool.clone();
+        tasks.push(tokio::spawn(async move {
+            while let Some(id) = claim_once(&pool, strategy).await? {
+                sqlx::query("INSERT INTO claims (id, claimer) VALUES ($1, $2)")
+                    .bind(id)
+                    .bind(claimer)
+                    .execute(&pool)
+                    .await?;
+            }
+            anyhow::Ok(())
+        }));
+    }
+    for task in tasks {
+        task.await??;
+    }
+    let secs = started.elapsed().as_secs_f64();
+
+    let (total, distinct): (i64, i64) =
+        sqlx::query_as("SELECT count(*), count(DISTINCT id) FROM claims")
+            .fetch_one(&pool)
+            .await?;
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM q WHERE state = 'queued'")
+        .fetch_one(&pool)
+        .await?;
+    claim_pool.close().await;
+    pool.close().await;
+    Ok(json!({
+        "secs": round3(secs),
+        "jobs_per_sec": round3(distinct as f64 / secs),
+        "claims_recorded": total,
+        "double_claims": total - distinct,
+        "jobs_left_unclaimed": left,
+    }))
+}
+
+async fn claim_once(pool: &PgPool, strategy: &str) -> anyhow::Result<Option<i64>> {
+    const NEXT: &str = "SELECT id FROM q WHERE state = 'queued' ORDER BY id LIMIT 1";
+    const TAKE: &str = "UPDATE q SET state = 'done' WHERE id = $1";
+    Ok(match strategy {
+        "naive" => {
+            let next: Option<i64> = sqlx::query_scalar(NEXT).fetch_optional(pool).await?;
+            if let Some(id) = next {
+                sqlx::query(TAKE).bind(id).execute(pool).await?;
+            }
+            next
+        }
+        "for_update" => {
+            let mut tx = pool.begin().await?;
+            let next: Option<i64> = sqlx::query_scalar(&format!("{NEXT} FOR UPDATE"))
+                .fetch_optional(&mut *tx)
+                .await?;
+            if let Some(id) = next {
+                sqlx::query(TAKE).bind(id).execute(&mut *tx).await?;
+            }
+            tx.commit().await?;
+            next
+        }
+        _ => {
+            sqlx::query_scalar(
+                "WITH next AS (SELECT id FROM q WHERE state = 'queued'
+                               ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
+                 UPDATE q SET state = 'done' FROM next WHERE q.id = next.id RETURNING q.id",
+            )
+            .fetch_optional(pool)
+            .await?
+        }
+    })
 }
 
 /// Minimal HTTP/1.0 GET, to avoid an HTTP client dependency for one call.

@@ -49,7 +49,7 @@ Two baselines, used for different purposes:
   jobs.
 - **Performance baseline:** the same naive claim made safe with a plain
   `FOR UPDATE` (blocking) instead of `SKIP LOCKED`, run through the same
-  harness. See [BENCHMARKS.md](BENCHMARKS.md).
+  harness. See [EXPERIMENTS.md](../EXPERIMENTS.md).
 
 An earlier Python prototype of the same idea lives in the parent directory. It
 informed several decisions (see [DECISIONS.md](DECISIONS.md)) but is not a

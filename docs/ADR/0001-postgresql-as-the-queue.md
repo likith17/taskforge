@@ -33,7 +33,7 @@ implementations usually lose or duplicate work.
 ## Consequences
 
 - Throughput is bounded by PostgreSQL write capacity. That limit will be
-  *measured* (BENCHMARKS.md), not assumed.
+  *measured* (EXPERIMENTS.md), not assumed.
 - Finished rows accumulate; a retention job is needed (planned).
 - High churn on one table means autovacuum tuning matters at scale.
 - Redis stays a possible later addition for one specific job — wake-up
