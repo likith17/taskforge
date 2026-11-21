@@ -1,0 +1,21 @@
+[package]
+name = "taskforge-chaos"
+description = "Chaos and benchmark harness for TaskForge: runs real worker processes, kills them, and checks the invariants."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+taskforge-domain.workspace = true
+taskforge-storage.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

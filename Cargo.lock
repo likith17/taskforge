@@ -1735,6 +1735,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "taskforge-chaos"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde_json",
+ "sqlx",
+ "taskforge-domain",
+ "taskforge-storage",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "taskforge-domain"
 version = "0.1.0"
 dependencies = [
