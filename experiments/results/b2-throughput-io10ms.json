@@ -1,0 +1,183 @@
+{
+  "config": {
+    "concurrency_per_worker": 1,
+    "io_ms": 10,
+    "jobs_per_run": 2000,
+    "poll_interval_ms": 50,
+    "preloaded": true,
+    "repeats": 3,
+    "workload": "io"
+  },
+  "experiment": "bench",
+  "name": "b2-throughput-io10ms",
+  "results": [
+    {
+      "runs": [
+        {
+          "claim_latency_mean_ms": 3.335,
+          "claims": 2001.0,
+          "job_held_secs": {
+            "max": 0.031,
+            "mean": 0.028,
+            "n": 2000,
+            "p50": 0.028,
+            "p95": 0.029,
+            "p99": 0.03
+          },
+          "jobs": 2000,
+          "repeat": 1,
+          "span_secs": 61.834,
+          "throughput_jobs_per_sec": 32.344
+        },
+        {
+          "claim_latency_mean_ms": 3.961,
+          "claims": 2001.0,
+          "job_held_secs": {
+            "max": 0.16,
+            "mean": 0.029,
+            "n": 2000,
+            "p50": 0.028,
+            "p95": 0.029,
+            "p99": 0.076
+          },
+          "jobs": 2000,
+          "repeat": 2,
+          "span_secs": 65.97,
+          "throughput_jobs_per_sec": 30.317
+        },
+        {
+          "claim_latency_mean_ms": 2.954,
+          "claims": 2002.0,
+          "job_held_secs": {
+            "max": 0.031,
+            "mean": 0.028,
+            "n": 2000,
+            "p50": 0.028,
+            "p95": 0.029,
+            "p99": 0.03
+          },
+          "jobs": 2000,
+          "repeat": 3,
+          "span_secs": 61.756,
+          "throughput_jobs_per_sec": 32.386
+        }
+      ],
+      "throughput_max": 32.386,
+      "throughput_median": 32.344,
+      "throughput_min": 30.317,
+      "workers": 1
+    },
+    {
+      "runs": [
+        {
+          "claim_latency_mean_ms": 3.261,
+          "claims": 2004.0,
+          "job_held_secs": {
+            "max": 0.03,
+            "mean": 0.028,
+            "n": 2000,
+            "p50": 0.028,
+            "p95": 0.029,
+            "p99": 0.03
+          },
+          "jobs": 2000,
+          "repeat": 1,
+          "span_secs": 15.48,
+          "throughput_jobs_per_sec": 129.201
+        },
+        {
+          "claim_latency_mean_ms": 3.332,
+          "claims": 2004.0,
+          "job_held_secs": {
+            "max": 0.033,
+            "mean": 0.028,
+            "n": 2000,
+            "p50": 0.028,
+            "p95": 0.029,
+            "p99": 0.03
+          },
+          "jobs": 2000,
+          "repeat": 2,
+          "span_secs": 15.422,
+          "throughput_jobs_per_sec": 129.686
+        },
+        {
+          "claim_latency_mean_ms": 3.335,
+          "claims": 2004.0,
+          "job_held_secs": {
+            "max": 0.033,
+            "mean": 0.028,
+            "n": 2000,
+            "p50": 0.028,
+            "p95": 0.029,
+            "p99": 0.029
+          },
+          "jobs": 2000,
+          "repeat": 3,
+          "span_secs": 15.481,
+          "throughput_jobs_per_sec": 129.19
+        }
+      ],
+      "throughput_max": 129.686,
+      "throughput_median": 129.201,
+      "throughput_min": 129.19,
+      "workers": 4
+    },
+    {
+      "runs": [
+        {
+          "claim_latency_mean_ms": 4.196,
+          "claims": 2016.0,
+          "job_held_secs": {
+            "max": 0.039,
+            "mean": 0.028,
+            "n": 2000,
+            "p50": 0.028,
+            "p95": 0.029,
+            "p99": 0.031
+          },
+          "jobs": 2000,
+          "repeat": 1,
+          "span_secs": 3.902,
+          "throughput_jobs_per_sec": 512.545
+        },
+        {
+          "claim_latency_mean_ms": 4.853,
+          "claims": 2016.0,
+          "job_held_secs": {
+            "max": 0.041,
+            "mean": 0.027,
+            "n": 2000,
+            "p50": 0.027,
+            "p95": 0.028,
+            "p99": 0.03
+          },
+          "jobs": 2000,
+          "repeat": 2,
+          "span_secs": 3.909,
+          "throughput_jobs_per_sec": 511.579
+        },
+        {
+          "claim_latency_mean_ms": 4.117,
+          "claims": 2022.0,
+          "job_held_secs": {
+            "max": 0.039,
+            "mean": 0.028,
+            "n": 2000,
+            "p50": 0.028,
+            "p95": 0.029,
+            "p99": 0.03
+          },
+          "jobs": 2000,
+          "repeat": 3,
+          "span_secs": 3.898,
+          "throughput_jobs_per_sec": 513.025
+        }
+      ],
+      "throughput_max": 513.025,
+      "throughput_median": 512.545,
+      "throughput_min": 511.579,
+      "workers": 16
+    }
+  ]
+}

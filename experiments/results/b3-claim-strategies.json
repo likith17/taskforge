@@ -1,0 +1,295 @@
+{
+  "config": {
+    "claimers": [
+      1,
+      4,
+      16
+    ],
+    "jobs_per_run": 5000,
+    "note": "bare table; one claim = the strategy's claim statement(s) plus one INSERT recording it",
+    "repeats": 3
+  },
+  "experiment": "claims",
+  "name": "b3-claim-strategies",
+  "results": [
+    {
+      "claimers": 1,
+      "double_claims_total": 0,
+      "jobs_per_sec_max": 215.675,
+      "jobs_per_sec_median": 209.349,
+      "jobs_per_sec_min": 190.315,
+      "runs": [
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 190.315,
+          "secs": 26.272
+        },
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 215.675,
+          "secs": 23.183
+        },
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 209.349,
+          "secs": 23.884
+        }
+      ],
+      "strategy": "naive"
+    },
+    {
+      "claimers": 4,
+      "double_claims_total": 15702,
+      "jobs_per_sec_max": 352.579,
+      "jobs_per_sec_median": 350.912,
+      "jobs_per_sec_min": 344.178,
+      "runs": [
+        {
+          "claims_recorded": 10193,
+          "double_claims": 5193,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 344.178,
+          "secs": 14.527
+        },
+        {
+          "claims_recorded": 10227,
+          "double_claims": 5227,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 352.579,
+          "secs": 14.181
+        },
+        {
+          "claims_recorded": 10282,
+          "double_claims": 5282,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 350.912,
+          "secs": 14.249
+        }
+      ],
+      "strategy": "naive"
+    },
+    {
+      "claimers": 16,
+      "double_claims_total": 76890,
+      "jobs_per_sec_max": 265.162,
+      "jobs_per_sec_median": 263.098,
+      "jobs_per_sec_min": 60.03,
+      "runs": [
+        {
+          "claims_recorded": 30602,
+          "double_claims": 25602,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 265.162,
+          "secs": 18.856
+        },
+        {
+          "claims_recorded": 30586,
+          "double_claims": 25586,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 263.098,
+          "secs": 19.004
+        },
+        {
+          "claims_recorded": 30702,
+          "double_claims": 25702,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 60.03,
+          "secs": 83.291
+        }
+      ],
+      "strategy": "naive"
+    },
+    {
+      "claimers": 1,
+      "double_claims_total": 0,
+      "jobs_per_sec_max": 218.451,
+      "jobs_per_sec_median": 214.076,
+      "jobs_per_sec_min": 188.363,
+      "runs": [
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 188.363,
+          "secs": 26.544
+        },
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 214.076,
+          "secs": 23.356
+        },
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 218.451,
+          "secs": 22.888
+        }
+      ],
+      "strategy": "for_update"
+    },
+    {
+      "claimers": 4,
+      "double_claims_total": 0,
+      "jobs_per_sec_max": 694.963,
+      "jobs_per_sec_median": 690.66,
+      "jobs_per_sec_min": 690.179,
+      "runs": [
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 690.179,
+          "secs": 7.244
+        },
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 694.963,
+          "secs": 7.195
+        },
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 690.66,
+          "secs": 7.239
+        }
+      ],
+      "strategy": "for_update"
+    },
+    {
+      "claimers": 16,
+      "double_claims_total": 0,
+      "jobs_per_sec_max": 662.553,
+      "jobs_per_sec_median": 653.286,
+      "jobs_per_sec_min": 647.036,
+      "runs": [
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 662.553,
+          "secs": 7.547
+        },
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 647.036,
+          "secs": 7.728
+        },
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 653.286,
+          "secs": 7.654
+        }
+      ],
+      "strategy": "for_update"
+    },
+    {
+      "claimers": 1,
+      "double_claims_total": 0,
+      "jobs_per_sec_max": 291.5,
+      "jobs_per_sec_median": 291.293,
+      "jobs_per_sec_min": 272.954,
+      "runs": [
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 272.954,
+          "secs": 18.318
+        },
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 291.293,
+          "secs": 17.165
+        },
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 291.5,
+          "secs": 17.153
+        }
+      ],
+      "strategy": "skip_locked"
+    },
+    {
+      "claimers": 4,
+      "double_claims_total": 0,
+      "jobs_per_sec_max": 1026.661,
+      "jobs_per_sec_median": 1016.533,
+      "jobs_per_sec_min": 994.065,
+      "runs": [
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 1026.661,
+          "secs": 4.87
+        },
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 1016.533,
+          "secs": 4.919
+        },
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 994.065,
+          "secs": 5.03
+        }
+      ],
+      "strategy": "skip_locked"
+    },
+    {
+      "claimers": 16,
+      "double_claims_total": 0,
+      "jobs_per_sec_max": 2395.289,
+      "jobs_per_sec_median": 2352.858,
+      "jobs_per_sec_min": 2317.075,
+      "runs": [
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 2395.289,
+          "secs": 2.087
+        },
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 2352.858,
+          "secs": 2.125
+        },
+        {
+          "claims_recorded": 5000,
+          "double_claims": 0,
+          "jobs_left_unclaimed": 0,
+          "jobs_per_sec": 2317.075,
+          "secs": 2.158
+        }
+      ],
+      "strategy": "skip_locked"
+    }
+  ]
+}

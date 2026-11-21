@@ -1,0 +1,183 @@
+{
+  "config": {
+    "concurrency_per_worker": 1,
+    "io_ms": null,
+    "jobs_per_run": 3000,
+    "poll_interval_ms": 50,
+    "preloaded": true,
+    "repeats": 3,
+    "workload": "noop"
+  },
+  "experiment": "bench",
+  "name": "b1-throughput-noop",
+  "results": [
+    {
+      "runs": [
+        {
+          "claim_latency_mean_ms": 3.592,
+          "claims": 3002.0,
+          "job_held_secs": {
+            "max": 0.093,
+            "mean": 0.004,
+            "n": 3000,
+            "p50": 0.003,
+            "p95": 0.004,
+            "p99": 0.029
+          },
+          "jobs": 3000,
+          "repeat": 1,
+          "span_secs": 18.26,
+          "throughput_jobs_per_sec": 164.297
+        },
+        {
+          "claim_latency_mean_ms": 2.818,
+          "claims": 3001.0,
+          "job_held_secs": {
+            "max": 0.026,
+            "mean": 0.003,
+            "n": 3000,
+            "p50": 0.003,
+            "p95": 0.004,
+            "p99": 0.005
+          },
+          "jobs": 3000,
+          "repeat": 2,
+          "span_secs": 14.362,
+          "throughput_jobs_per_sec": 208.882
+        },
+        {
+          "claim_latency_mean_ms": 2.899,
+          "claims": 3002.0,
+          "job_held_secs": {
+            "max": 0.013,
+            "mean": 0.003,
+            "n": 3000,
+            "p50": 0.003,
+            "p95": 0.004,
+            "p99": 0.005
+          },
+          "jobs": 3000,
+          "repeat": 3,
+          "span_secs": 14.653,
+          "throughput_jobs_per_sec": 204.736
+        }
+      ],
+      "throughput_max": 208.882,
+      "throughput_median": 204.736,
+      "throughput_min": 164.297,
+      "workers": 1
+    },
+    {
+      "runs": [
+        {
+          "claim_latency_mean_ms": 3.347,
+          "claims": 3004.0,
+          "job_held_secs": {
+            "max": 0.016,
+            "mean": 0.003,
+            "n": 3000,
+            "p50": 0.003,
+            "p95": 0.004,
+            "p99": 0.005
+          },
+          "jobs": 3000,
+          "repeat": 1,
+          "span_secs": 4.282,
+          "throughput_jobs_per_sec": 700.675
+        },
+        {
+          "claim_latency_mean_ms": 3.243,
+          "claims": 3006.0,
+          "job_held_secs": {
+            "max": 0.016,
+            "mean": 0.003,
+            "n": 3000,
+            "p50": 0.003,
+            "p95": 0.004,
+            "p99": 0.005
+          },
+          "jobs": 3000,
+          "repeat": 2,
+          "span_secs": 4.151,
+          "throughput_jobs_per_sec": 722.72
+        },
+        {
+          "claim_latency_mean_ms": 3.511,
+          "claims": 3008.0,
+          "job_held_secs": {
+            "max": 0.016,
+            "mean": 0.004,
+            "n": 3000,
+            "p50": 0.003,
+            "p95": 0.005,
+            "p99": 0.005
+          },
+          "jobs": 3000,
+          "repeat": 3,
+          "span_secs": 4.43,
+          "throughput_jobs_per_sec": 677.142
+        }
+      ],
+      "throughput_max": 722.72,
+      "throughput_median": 700.675,
+      "throughput_min": 677.142,
+      "workers": 4
+    },
+    {
+      "runs": [
+        {
+          "claim_latency_mean_ms": 6.064,
+          "claims": 3032.0,
+          "job_held_secs": {
+            "max": 0.029,
+            "mean": 0.006,
+            "n": 3000,
+            "p50": 0.006,
+            "p95": 0.008,
+            "p99": 0.009
+          },
+          "jobs": 3000,
+          "repeat": 1,
+          "span_secs": 1.977,
+          "throughput_jobs_per_sec": 1517.674
+        },
+        {
+          "claim_latency_mean_ms": 6.104,
+          "claims": 3032.0,
+          "job_held_secs": {
+            "max": 0.031,
+            "mean": 0.006,
+            "n": 3000,
+            "p50": 0.006,
+            "p95": 0.008,
+            "p99": 0.01
+          },
+          "jobs": 3000,
+          "repeat": 2,
+          "span_secs": 1.987,
+          "throughput_jobs_per_sec": 1509.442
+        },
+        {
+          "claim_latency_mean_ms": 6.257,
+          "claims": 3016.0,
+          "job_held_secs": {
+            "max": 0.031,
+            "mean": 0.006,
+            "n": 3000,
+            "p50": 0.006,
+            "p95": 0.008,
+            "p99": 0.01
+          },
+          "jobs": 3000,
+          "repeat": 3,
+          "span_secs": 2.039,
+          "throughput_jobs_per_sec": 1471.185
+        }
+      ],
+      "throughput_max": 1517.674,
+      "throughput_median": 1509.442,
+      "throughput_min": 1471.185,
+      "workers": 16
+    }
+  ]
+}
