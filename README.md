@@ -250,6 +250,13 @@ cargo build --release -p taskforge -p taskforge-chaos
 ./target/release/taskforge-chaos chaos --jobs 1000 --workers 8 --kill-every-ms 500 --scheduler-kill-every-ms 3000
 ```
 
+Deterministic simulation testing:
+[taskforge-dst](https://github.com/likith17/taskforge-dst) runs the real
+worker and reaper in a simulated world where time, the network, crashes and
+randomness all follow from one seed, checks six invariants in every run, and
+replays any failure exactly. Its [BUGS.md](https://github.com/likith17/taskforge-dst/blob/main/BUGS.md)
+records what it found, including the clock-rate limit of worker self-fencing.
+
 ## Measured results
 
 From [EXPERIMENTS.md](EXPERIMENTS.md): one Windows laptop, with PostgreSQL in
