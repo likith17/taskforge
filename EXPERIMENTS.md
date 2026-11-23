@@ -13,6 +13,7 @@ quantity could not be measured, this document says so.
 | OS | Windows 11 Home (build 26200) |
 | Database | PostgreSQL 16.16 (`postgres:16-alpine`) in Docker Desktop 29.6.1 (WSL2 VM: 22 CPUs, 16 GB). Defaults: `synchronous_commit = on`, `shared_buffers = 128MB` |
 | Build | Rust 1.85.0, `--release` (thin LTO) |
+| Code measured | Commit `d063ec1`. The later commit `4ff10dc` (simulation seams: `LocalTime`, settable job ids, ordered worker map) intends no behaviour change and passes all tests, but these runs were not repeated on it |
 | Topology | Everything on one machine: harness, worker processes and the database VM share the CPU |
 
 Consequences for reading the numbers: absolute throughput is pessimistic

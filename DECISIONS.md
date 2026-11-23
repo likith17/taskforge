@@ -237,13 +237,19 @@ forever. The trade-off is in 2.5.
 
 ### 3.1 Scheduling logic separated from I/O
 
-**Decision.** Three seams, so a deterministic simulation can replace all I/O:
+**Decision.** Four seams, so a deterministic simulation can replace all I/O:
 
 | Seam | Production | Test / simulation |
 |---|---|---|
 | `JobStore` trait (storage) | `PgJobStore` | `MemJobStore` |
 | `Clock` trait (time) | database `now()` inside `PgJobStore` | `ManualClock` in `MemJobStore` |
 | `Jitter` trait (randomness) | `SplitMix64::from_entropy()` | `FixedJitter`, `SplitMix64::seeded(n)` |
+| `LocalTime` trait (worker timers) | `TokioTime` | a per-worker timer running at its own rate |
+
+Two smaller seams remove the last sources of nondeterminism: job ids can be
+supplied (`NewJob::with_id`) instead of drawn from the wall clock and OS
+randomness, and the worker keeps its running jobs in a `BTreeMap`, so
+heartbeats and shutdown visit them in a fixed order.
 
 The rules themselves are pure functions in the domain crate: `decide_failure`,
 `RetryPolicy::delay` and `JobState::can_transition_to`. The worker, reaper and
@@ -261,9 +267,15 @@ counters, histories and delays (to the microsecond PostgreSQL stores).
 **Why the PostgreSQL store does not take a `Clock`.** Its deadlines are compared
 with the database clock on purpose: a single clock means no clock-skew bugs
 between machines. Passing `now` in from each process would bring skew back.
-Worker *loops* use Tokio's timer, which tests can already pause and advance
-(`start_paused`), so a separate clock trait there would add indirection without
-new capability. A full simulation (madsim-style) would swap the runtime instead.
+**Why the worker has its own time trait.** Tokio's paused clock makes tests
+deterministic, but it gives every task the same clock. What needs testing is
+clock *rate*: a worker fences itself after 90% of a lease measured on its own
+timer, which is safe only while that timer runs at most about 10% slow relative
+to the store's clock. `LocalTime` lets a simulation give each worker a timer
+running at its own rate, so that assumption can be tested rather than stated.
+(The first version of this document argued a worker clock trait would add
+indirection without new capability; drift testing is the capability it
+overlooked.)
 
 **Why `impl Future + Send` rather than `async fn` or `async-trait`.** Generic
 code spawns store futures onto Tokio, which needs them to be `Send`; an `async

@@ -1,9 +1,11 @@
 # TaskForge
 
 A fault-tolerant background job scheduler in Rust, on PostgreSQL. Producers
-submit jobs over HTTP; any number of worker processes run them. Workers, the
-scheduler and the API can be killed at any moment without losing a job or
-committing one twice.
+submit jobs over HTTP; any number of worker processes run them. Workers and the
+scheduler can be killed at any moment without losing a job or committing one
+twice; the chaos experiments below do exactly that, hundreds of times per run.
+The API keeps no state either: a client whose request was cut off retries it
+with the same `Idempotency-Key`.
 
 The engineering ideas come from Celery, Sidekiq and Temporal. The scope is
 deliberately much smaller: one binary, one database, no broker.
@@ -19,7 +21,7 @@ what it promises when those happen.
 
 - An accepted job is never lost. It is durable once `POST /jobs` returns `201`.
 - A job is never held by two workers at once, and two attempts never run at the
-  same time.
+  same time (for handlers that reach an `.await`; see Known limitations).
 - **At most one result is ever committed per job.**
 - A retried or duplicated submission with the same `Idempotency-Key` creates one
   job.
@@ -32,7 +34,7 @@ indistinguishable from dying before starting, so the job must run again or risk
 being lost. Execution is therefore **at-least-once**, and results are
 exactly-once. Handlers with external side effects get a stable job id to use as
 an idempotency key downstream. The chaos experiments measure both halves:
-re-executions happen (about 5% of jobs under heavy killing), and duplicate
+re-executions happen (5–6% of jobs under heavy killing), and duplicate
 committed results stay at zero. See [DECISIONS.md §1.1](DECISIONS.md).
 
 ## Architecture
@@ -84,19 +86,28 @@ crates/
   storage/    trait JobStore; PgJobStore (all SQL) and MemJobStore;
               migrations; conformance tests run against both
   api/        Axum router, generic over JobStore
-  worker/     claim loop, heartbeats, self-fencing, timeouts, handlers
+  worker/     claim loop, heartbeats, self-fencing, timeouts, handlers;
+              all worker timing goes through the LocalTime trait
   scheduler/  lease reaper and purger
   metrics/    Prometheus metrics
   taskforge/  the binary: serve | worker | scheduler | all | migrate
   chaos/      real-process chaos and benchmark harness
 ```
 
-**Logic separated from I/O.** The worker, reaper and API are generic over the
-`JobStore` trait. Time and randomness are behind the `Clock` and `Jitter`
-traits. The rules are pure functions in `domain`. `MemJobStore` runs everything
-on a `ManualClock` and a seeded `SplitMix64`, which is the base for a
-deterministic simulation. One set of conformance scenarios runs against both
-stores, so the SQL and the pure rules cannot drift apart. See
+**Logic separated from I/O.** The rules are pure functions in `domain`. All I/O
+sits behind traits, so a deterministic simulation can replace each piece:
+
+| Seam | Production | Test / simulation |
+|---|---|---|
+| `JobStore` (storage) | `PgJobStore` | `MemJobStore` |
+| `Clock` (the store's time) | PostgreSQL `now()` | `ManualClock` |
+| `Jitter` (randomness) | `SplitMix64` seeded from entropy | `FixedJitter`, `SplitMix64::seeded` |
+| `LocalTime` (worker timers) | `TokioTime` | a timer running at its own rate, to test clock drift |
+
+Job ids can also be supplied (`NewJob::with_id`) instead of generated from the
+wall clock, and the worker iterates its jobs in a fixed order. The worker, reaper
+and API are generic over `JobStore`. One set of conformance scenarios runs
+against both stores, so the SQL and the pure rules cannot drift apart. See
 [DECISIONS.md §3.1](DECISIONS.md).
 
 ## Job states
@@ -149,29 +160,46 @@ including list, cancel, retry and `/metrics`, is in [docs/API.md](docs/API.md).
 
 ### Watch a worker die and its job recover
 
-In separate terminals, run the API, then the worker command below in two more
-terminals, so that there are two workers with a short lease:
+Run the binary directly rather than through `cargo run`, so that killing it kills
+the worker and not `cargo`. Build it first (and stop `taskforge all` if it is
+still running, since it uses the same port):
 
 ```bash
-cargo run --release -p taskforge -- serve
+cargo build --release -p taskforge
+```
+
+Then, in three terminals, start the API and two named workers with a 3-second
+lease. These commands use bash syntax; in PowerShell, set variables with
+`$env:TASKFORGE_LEASE_MS="3000"` first. `DATABASE_URL` is not set for you outside
+`cargo`, so it is given explicitly:
+
+```bash
+DATABASE_URL=postgres://taskforge:taskforge@127.0.0.1:5434/taskforge ./target/release/taskforge serve
 ```
 
 ```bash
-TASKFORGE_LEASE_MS=3000 cargo run --release -p taskforge -- worker
+DATABASE_URL=postgres://taskforge:taskforge@127.0.0.1:5434/taskforge TASKFORGE_LEASE_MS=3000 TASKFORGE_WORKER_ID=worker-a ./target/release/taskforge worker
 ```
 
-Submit a 20-second job, then kill the worker running it the hard way, with
-`kill -9` or from Task Manager (`Ctrl+C` would be a graceful shutdown, which hands
-the job back instead):
+```bash
+DATABASE_URL=postgres://taskforge:taskforge@127.0.0.1:5434/taskforge TASKFORGE_LEASE_MS=3000 TASKFORGE_WORKER_ID=worker-b ./target/release/taskforge worker
+```
+
+Submit a 20-second job:
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/jobs -H "content-type: application/json" -d '{"kind":"sleep","payload":{"ms":20000}}'
 ```
 
-Within a few seconds of the kill (one lease, plus a reaper interval and a short
-backoff), `GET /jobs/<id>/attempts` shows attempt 1 as `lease_expired`, and
-attempt 2 starts on the other worker. The whole thing,
-automated, with checks: `taskforge-chaos chaos` (below).
+`GET /jobs/<id>` shows which worker holds it in `lease_owner`. Kill that worker
+the hard way: `kill -9` on its process, or End task in Task Manager. `Ctrl+C`
+would be a graceful shutdown, which hands the job back instead of abandoning it.
+
+Within a few seconds (one lease, plus a reaper interval and a short backoff),
+`GET /jobs/<id>/attempts` shows attempt 1 as `lease_expired`, and attempt 2
+running on the other worker. In two recorded runs, attempt 1 was marked
+`lease_expired` 2–3 s after the kill and attempt 2 had started by 3–4 s. The same
+thing, automated and checked, is `taskforge-chaos chaos` (below).
 
 ### Configuration
 
@@ -179,7 +207,8 @@ Environment variables (see [.env.example](.env.example)):
 
 | Variable | Default | |
 |---|---|---|
-| `DATABASE_URL` | required | `cargo` commands default to the Compose database |
+| `DATABASE_URL` | required | `cargo run` and `cargo test` default to the Compose database (`.cargo/config.toml`) |
+| `TASKFORGE_DB_MAX_CONNECTIONS` | `10` | Main pool; workers add a separate 2-connection pool for heartbeats |
 | `TASKFORGE_BIND` | `127.0.0.1:8080` | Loopback: there is no authentication |
 | `TASKFORGE_QUEUES` | `default` | Comma-separated |
 | `TASKFORGE_CONCURRENCY` | `4` | Jobs per worker process at once |
@@ -193,7 +222,9 @@ Environment variables (see [.env.example](.env.example)):
 | `TASKFORGE_SHUTDOWN_GRACE_SECS` | `30` | Drain time on `SIGTERM`/`Ctrl+C` |
 | `TASKFORGE_METRICS_BIND` | unset | `/metrics` for worker/scheduler processes |
 | `TASKFORGE_WORKER_ID` | generated | Must be unique per process |
+| `TASKFORGE_MAX_BODY_BYTES` | `66560` | Request body limit (a 64 KiB payload plus the envelope) |
 | `TASKFORGE_LOG_FORMAT` | `text` | `json` for structured logs |
+| `TASKFORGE_CHAOS_HANDLER` | `false` | Registers the test-only `chaos` job kind; for the harness only |
 
 ## Testing
 
@@ -201,12 +232,13 @@ Environment variables (see [.env.example](.env.example)):
 cargo test --workspace
 ```
 
-**138 tests**: unit and property tests (state machine, backoff, failure
-decisions, fingerprints, config), integration tests against a fresh PostgreSQL
-database per test, and in-process fault injection (crashed and partitioned
-workers, lost leases, cancel races, database outages, duplicate-submission
-storms). CI (`.github/workflows/ci.yml`) also runs a chaos smoke run with real
-processes.
+**142 tests**: unit and property tests (state machine, backoff, failure
+decisions, fingerprints, config, worker timers), integration tests against a
+fresh PostgreSQL database per test, and in-process fault injection (crashed and
+partitioned workers, lost leases, cancel races, database outages,
+duplicate-submission storms). The database must be running
+(`docker compose up -d db`). The CI workflow (`.github/workflows/ci.yml`) runs
+formatting, lints and these tests, then a short chaos run with real processes.
 
 Real-process chaos and benchmarks:
 
@@ -220,25 +252,33 @@ cargo build --release -p taskforge -p taskforge-chaos
 
 ## Measured results
 
-From [EXPERIMENTS.md](EXPERIMENTS.md): one laptop, with PostgreSQL in Docker on
-the same machine. Every number is computed from the database, not estimated.
+From [EXPERIMENTS.md](EXPERIMENTS.md): one Windows laptop, with PostgreSQL in
+Docker on the same machine. Every number was measured, from the database's
+timestamps or the workers' own metrics; none is estimated. The runs used the
+code as of commit `d063ec1`. A later commit (`4ff10dc`) routed worker timing
+through `LocalTime` with no intended behaviour change; it passes the tests but
+has not been re-measured.
 
-**Chaos: 12 runs.** 1,000 jobs, 8 worker processes, a worker `SIGKILL`ed every
-500 ms, and the scheduler killed every 3 s in some runs. 627 orphaned attempts
-in total.
+**Chaos: 12 runs, 4 configurations, 3 seeds each.** Worker processes were
+hard-killed (`TerminateProcess`, the Windows equivalent of `SIGKILL`) on a timer,
+627 orphaned attempts in total:
+
+- **C1–C3:** 1,000 jobs on 8 workers × 2 slots, a worker killed every 500 ms.
+  C2 and C3 also kill the scheduler every 3 s; in C3 workers reap too.
+- **C4:** 40 long jobs on 48 slots, so nothing waits in a queue.
 
 | | Result |
 |---|---|
 | Completion rate (healthy jobs) | **100%** in all 12 runs |
 | Duplicate committed results | **0** in all 12 runs |
 | Lost jobs / stuck leases / open attempts | 0 / 0 / 0 |
-| Deliberately failing jobs dead-lettered | 100% (50/50 per run) |
-| Jobs re-executed (at-least-once) | 50–56 of 950 per run (5–6%) |
+| Deliberately failing jobs dead-lettered | 50 of 50 in every C1–C3 run |
+| Jobs re-executed (at-least-once) | 50–56 of 950 per C1–C3 run (5–6%) |
 | Jobs whose *unprotected* side effect ran twice | 0–6 per run |
-| Re-queue after a worker crash (2 s lease) | mean 1.94–1.99 s, p95 ≤ 2.22 s |
-| …with the only reaper also being killed | p95 up to 3.00 s; back to 2.11 s when workers reap too |
-| Restart after a crash, spare capacity | mean 2.16–2.53 s, p95 2.71–3.72 s |
-| Restart after a crash, saturated queue | mean ≈ 7.4 s, p95 13–15 s (waits behind the backlog) |
+| Re-queue after a worker crash (2 s lease; C1, C3) | mean 1.94–1.99 s, p95 ≤ 2.22 s |
+| …when the only reaper is also killed (C2) | p95 up to 3.00 s; 2.11 s when workers reap too (C3) |
+| Restart after a crash, spare capacity (C4) | mean 2.16–2.53 s, p95 2.71–3.72 s |
+| Restart after a crash, saturated queue (C1–C3) | mean 7.2–7.6 s, p95 13–15 s (waits behind the backlog) |
 
 **Throughput.** A preloaded backlog, single-slot worker processes, median of 3
 runs:
@@ -282,8 +322,12 @@ database write), and scaling flattens to 7.4× at 16 as claims contend.
   would work, but none is set up.
 - **Idempotency keys expire with their job** (7-day retention by default).
 - **No workflows, cron schedules or job dependencies.**
-- **No deterministic simulation yet.** The seams exist (`JobStore`, `Clock`,
-  `Jitter`, `MemJobStore`); the harness that drives them does not.
+- **Self-fencing assumes clocks run at nearly the same rate.** A worker stops
+  at 90% of its lease on its own timer, which is safe only while that timer runs
+  no more than about 10% slow relative to the database's clock.
+- **No deterministic simulation yet.** The seams exist (`JobStore`,
+  `MemJobStore`, `Clock`, `Jitter`, `LocalTime`, settable job ids); the harness
+  that drives them does not.
 - **Measurements come from a single laptop** with the database in a VM on the
   same machine. CPU and memory use were not measured.
 

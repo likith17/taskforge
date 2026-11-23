@@ -100,7 +100,8 @@ code), because abort only lands at an `.await`.
 
 The worker, reaper and API never touch SQL. They depend on the `JobStore`
 contract, so a deterministic simulation can run them on `MemJobStore` with a
-`ManualClock` and a seeded `SplitMix64`. DECISIONS.md 3.1 explains why the
+`ManualClock` and a seeded `SplitMix64`, and give each worker its own
+`LocalTime` timer. DECISIONS.md 3.1 explains why the
 PostgreSQL store expresses the rules in SQL rather than calling the domain
 functions, and how the conformance tests keep the two in step.
 
